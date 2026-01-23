@@ -1,5 +1,5 @@
 [profile.default]
-src = "src"
+src = "contracts"
 out = "out"
 libs = ["lib"]
 solc = "0.8.28"
@@ -9,6 +9,7 @@ viaIR = true
 evm_version = "cancun"
 optimizer = true
 optimizer_runs = 20_000
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
 
 
 [fmt]
