@@ -4,6 +4,7 @@ pragma solidity ^0.8.28;
 import {IKarma} from "../interfaces/IKarma.sol";
 import {IKarmaExtension} from "../interfaces/IKarmaExtension.sol";
 import {IKarmaReputationPresale} from "./interfaces/IKarmaReputationPresale.sol";
+import {IReputationManager} from "../interfaces/IReputationManager.sol";
 
 import {OwnerAdmins} from "../utils/OwnerAdmins.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -15,6 +16,7 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
  * @title KarmaReputationPresale
  * @notice A presale extension where reputation scores determine max contribution amounts.
  *         Everyone pays the same price per token - reputation just gates how much you can buy.
+ *         Scores are queried from an external ReputationManager contract.
  *
  * Score Mapping:
  *   - score_min = 1,000
@@ -46,6 +48,8 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
 
     // ============ State ============
 
+    IReputationManager public reputationManager;
+
     uint256 public minLockupDuration;
     uint256 public minScoreUploadBuffer;
     uint256 public karmaDefaultFeeBps;
@@ -65,8 +69,8 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
     // presaleId => user => refund claimed
     mapping(uint256 => mapping(address => bool)) public refundClaimed;
 
-    // presaleId => user => score
-    mapping(uint256 => mapping(address => uint256)) public userScores;
+    // presaleId => reputation context (used to query ReputationManager)
+    mapping(uint256 => bytes32) public presaleContext;
 
     // ============ Modifiers ============
 
@@ -93,10 +97,17 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
             }
         }
 
-        // Transition from PendingScores to Failed if score upload deadline passed
-        if (presale.status == PresaleStatus.PendingScores && block.timestamp > presale.scoreUploadDeadline) {
-            presale.status = PresaleStatus.Failed;
-            emit PresaleFailed(presaleId);
+        // Transition from PendingScores to ScoresUploaded if scores are available in ReputationManager
+        if (presale.status == PresaleStatus.PendingScores) {
+            bytes32 context = presaleContext[presaleId];
+            if (address(reputationManager) != address(0) && reputationManager.isFinalized(context)) {
+                presale.totalScore = reputationManager.getTotalScore(context);
+                presale.status = PresaleStatus.ScoresUploaded;
+                emit ScoresUploaded(presaleId, presale.totalScore);
+            } else if (block.timestamp > presale.scoreUploadDeadline) {
+                presale.status = PresaleStatus.Failed;
+                emit PresaleFailed(presaleId);
+            }
         }
         _;
     }
@@ -107,11 +118,13 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         address owner_,
         address factory_,
         address usdc_,
-        address karmaFeeRecipient_
+        address karmaFeeRecipient_,
+        address reputationManager_
     ) OwnerAdmins(owner_) {
         factory = IKarma(factory_);
         usdc = IERC20(usdc_);
         karmaFeeRecipient = karmaFeeRecipient_;
+        reputationManager = IReputationManager(reputationManager_);
         _nextPresaleId = 1;
         minLockupDuration = 7 days;
         minScoreUploadBuffer = 1 days;
@@ -119,6 +132,11 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
     }
 
     // ============ Admin Functions ============
+
+    function setReputationManager(address reputationManager_) external onlyOwner {
+        reputationManager = IReputationManager(reputationManager_);
+        emit ReputationManagerUpdated(reputationManager_);
+    }
 
     function setMinLockupDuration(uint256 duration) external onlyOwnerOrAdmin {
         uint256 oldDuration = minLockupDuration;
@@ -164,33 +182,33 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
     /**
      * @notice Create a new reputation-gated presale
      * @param presaleOwner Owner of the presale who receives USDC
-     * @param scoreUploader Address authorized to upload scores
      * @param targetUsdc Target USDC to raise
      * @param minUsdc Minimum USDC for presale to succeed
      * @param duration Duration of the presale contribution window
      * @param scoreUploadBuffer Time after presale ends to upload scores
      * @param lockupDuration Duration of token lockup after deployment
      * @param vestingDuration Duration of vesting after lockup ends
+     * @param reputationContext Context ID in ReputationManager to use for scores
      * @param deploymentConfig Token deployment configuration
      */
     function createPresale(
         address presaleOwner,
-        address scoreUploader,
         uint256 targetUsdc,
         uint256 minUsdc,
         uint256 duration,
         uint256 scoreUploadBuffer,
         uint256 lockupDuration,
         uint256 vestingDuration,
+        bytes32 reputationContext,
         IKarma.DeploymentConfig memory deploymentConfig
     ) external onlyOwnerOrAdmin returns (uint256 presaleId) {
         // Validations
         if (presaleOwner == address(0)) revert InvalidPresaleOwner();
-        if (scoreUploader == address(0)) revert InvalidScoreUploader();
         if (targetUsdc == 0 || minUsdc == 0 || minUsdc > targetUsdc) revert InvalidUsdcGoal();
         if (duration == 0 || duration > MAX_PRESALE_DURATION) revert InvalidPresaleDuration();
         if (scoreUploadBuffer < minScoreUploadBuffer) revert InvalidScoreUploadBuffer();
         if (lockupDuration < minLockupDuration) revert LockupDurationTooShort();
+        if (address(reputationManager) == address(0)) revert ReputationManagerNotSet();
 
         // Extension config must point to this contract as last extension
         uint256 extensionCount = deploymentConfig.extensionConfigs.length;
@@ -218,7 +236,6 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
 
         presale.status = PresaleStatus.Active;
         presale.presaleOwner = presaleOwner;
-        presale.scoreUploader = scoreUploader;
         presale.targetUsdc = targetUsdc;
         presale.minUsdc = minUsdc;
         presale.endTime = block.timestamp + duration;
@@ -228,17 +245,20 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         presale.karmaFeeBps = karmaDefaultFeeBps;
         presale.deploymentConfig = deploymentConfig;
 
+        // Store the reputation context for this presale
+        presaleContext[presaleId] = reputationContext;
+
         emit PresaleCreated(
             presaleId,
             presaleOwner,
-            scoreUploader,
             targetUsdc,
             minUsdc,
             presale.endTime,
             presale.scoreUploadDeadline,
             lockupDuration,
             vestingDuration,
-            presale.karmaFeeBps
+            presale.karmaFeeBps,
+            reputationContext
         );
     }
 
@@ -297,40 +317,16 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
     }
 
     /**
-     * @notice Upload reputation scores for users
+     * @notice Manually trigger score check from ReputationManager
+     * @dev This can be called by anyone to update presale status once scores are finalized
      * @param presaleId The presale ID
-     * @param users Array of user addresses
-     * @param scores Array of user scores
-     * @param totalScore Sum of all participant scores
      */
-    function uploadScores(
-        uint256 presaleId,
-        address[] calldata users,
-        uint256[] calldata scores,
-        uint256 totalScore
-    )
+    function checkScores(uint256 presaleId)
         external
         presaleExists(presaleId)
         updatePresaleStatus(presaleId)
     {
-        Presale storage presale = presaleState[presaleId];
-
-        if (msg.sender != presale.scoreUploader) revert Unauthorized();
-        if (presale.status != PresaleStatus.PendingScores) revert PresaleNotPendingScores();
-        if (block.timestamp > presale.scoreUploadDeadline) revert ScoreUploadDeadlinePassed();
-        if (users.length != scores.length) revert InvalidScore();
-        if (users.length == 0) revert InvalidScore();
-        if (totalScore == 0) revert InvalidScore();
-
-        // Store individual scores
-        for (uint256 i = 0; i < users.length; i++) {
-            userScores[presaleId][users[i]] = scores[i];
-        }
-
-        presale.totalScore = totalScore;
-        presale.status = PresaleStatus.ScoresUploaded;
-
-        emit ScoresUploaded(presaleId, totalScore);
+        // The modifier handles the status update
     }
 
     /**
@@ -390,7 +386,7 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         if (presale.status != PresaleStatus.Claimable) revert PresaleNotClaimable();
         if (block.timestamp < presale.lockupEndTime) revert PresaleLockupNotPassed();
 
-        uint256 score = userScores[presaleId][msg.sender];
+        uint256 score = _getUserScore(presaleId, msg.sender);
 
         // Calculate claimable amount with vesting
         uint256 totalAllocation = _calculateTokenAllocation(presaleId, msg.sender, score);
@@ -425,7 +421,7 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         if (presale.status != PresaleStatus.Claimable) revert PresaleNotClaimable();
         if (refundClaimed[presaleId][msg.sender]) revert NoRefundAvailable();
 
-        uint256 score = userScores[presaleId][msg.sender];
+        uint256 score = _getUserScore(presaleId, msg.sender);
         uint256 refund = _calculateRefund(presaleId, msg.sender, score);
         if (refund == 0) revert NoRefundAvailable();
 
@@ -520,7 +516,11 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
     }
 
     function getUserScore(uint256 presaleId, address user) external view returns (uint256) {
-        return userScores[presaleId][user];
+        return _getUserScore(presaleId, user);
+    }
+
+    function getPresaleContext(uint256 presaleId) external view returns (bytes32) {
+        return presaleContext[presaleId];
     }
 
     function getMaxContribution(uint256 presaleId, address user)
@@ -529,7 +529,7 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         presaleExists(presaleId)
         returns (uint256)
     {
-        uint256 score = userScores[presaleId][user];
+        uint256 score = _getUserScore(presaleId, user);
         return _calculateMaxContribution(presaleId, _mapScore(score));
     }
 
@@ -539,7 +539,7 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         presaleExists(presaleId)
         returns (uint256)
     {
-        uint256 score = userScores[presaleId][user];
+        uint256 score = _getUserScore(presaleId, user);
         return _calculateAcceptedContribution(presaleId, user, _mapScore(score));
     }
 
@@ -550,7 +550,7 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         returns (uint256)
     {
         if (refundClaimed[presaleId][user]) return 0;
-        uint256 score = userScores[presaleId][user];
+        uint256 score = _getUserScore(presaleId, user);
         return _calculateRefund(presaleId, user, score);
     }
 
@@ -560,7 +560,7 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         presaleExists(presaleId)
         returns (uint256)
     {
-        uint256 score = userScores[presaleId][user];
+        uint256 score = _getUserScore(presaleId, user);
         return _calculateTokenAllocation(presaleId, user, score);
     }
 
@@ -575,7 +575,7 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         if (presale.status != PresaleStatus.Claimable) return 0;
         if (block.timestamp < presale.lockupEndTime) return 0;
 
-        uint256 score = userScores[presaleId][user];
+        uint256 score = _getUserScore(presaleId, user);
         uint256 totalAllocation = _calculateTokenAllocation(presaleId, user, score);
         uint256 vested = _calculateVestedAmount(
             totalAllocation,
@@ -590,6 +590,15 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
     }
 
     // ============ Internal Functions ============
+
+    /**
+     * @notice Get user's score from ReputationManager
+     */
+    function _getUserScore(uint256 presaleId, address user) internal view returns (uint256) {
+        if (address(reputationManager) == address(0)) return 0;
+        bytes32 context = presaleContext[presaleId];
+        return reputationManager.getScore(context, user);
+    }
 
     /**
      * @notice Map raw reputation score to bounded range
@@ -629,9 +638,9 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         returns (uint256)
     {
         uint256 contributed = contributions[presaleId][user];
-        uint256 maxContrib = _calculateMaxContribution(presaleId, mappedScore);
+        uint256 maxContribution = _calculateMaxContribution(presaleId, mappedScore);
 
-        return contributed > maxContrib ? maxContrib : contributed;
+        return contributed < maxContribution ? contributed : maxContribution;
     }
 
     /**
@@ -688,5 +697,4 @@ contract KarmaReputationPresale is ReentrancyGuard, IKarmaReputationPresale, Own
         uint256 elapsed = block.timestamp - lockupEndTime;
         return (totalAllocation * elapsed) / vestingDuration;
     }
-
 }

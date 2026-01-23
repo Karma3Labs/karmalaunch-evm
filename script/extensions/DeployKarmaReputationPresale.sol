@@ -16,22 +16,25 @@ contract DeployKarmaReputationPresale is BaseScript {
         address karmaAddress = vm.envAddress("KARMA_ADDRESS");
         address usdcAddress = vm.envOr("USDC_ADDRESS", USDC);
         address karmaFeeRecipient = vm.envOr("KARMA_FEE_RECIPIENT", deployer);
+        address reputationManagerAddress = vm.envOr("REPUTATION_MANAGER_ADDRESS", address(0));
         bool enableOnKarma = vm.envOr("ENABLE_ON_KARMA", true);
 
         console.log("=== Deploying KarmaReputationPresale Extension ===");
         console.log("Karma address:", karmaAddress);
         console.log("USDC address:", usdcAddress);
         console.log("Karma fee recipient:", karmaFeeRecipient);
+        console.log("Reputation manager:", reputationManagerAddress);
         console.log("Enable on Karma:", enableOnKarma);
 
         startBroadcast();
 
         // Deploy KarmaReputationPresale
         KarmaReputationPresale reputationPresale = new KarmaReputationPresale(
-            deployer,           // owner
-            karmaAddress,       // factory
-            usdcAddress,        // usdc
-            karmaFeeRecipient   // karma fee recipient
+            deployer,                   // owner
+            karmaAddress,               // factory
+            usdcAddress,                // usdc
+            karmaFeeRecipient,          // karma fee recipient
+            reputationManagerAddress    // reputation manager (can be address(0) and set later)
         );
         deployed.karmaReputationPresale = address(reputationPresale);
         logDeployment("KarmaReputationPresale", deployed.karmaReputationPresale);
@@ -54,6 +57,7 @@ contract DeployKarmaReputationPresale is BaseScript {
         console.log("  Factory:", karmaAddress);
         console.log("  USDC:", usdcAddress);
         console.log("  Karma Fee Recipient:", karmaFeeRecipient);
+        console.log("  Reputation Manager:", reputationManagerAddress);
         console.log("");
         console.log("Default Parameters:");
         console.log("  Min Lockup Duration: 7 days");

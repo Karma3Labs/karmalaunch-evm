@@ -84,11 +84,13 @@ contract DeployKarma is BaseScript {
         console.log("--- Deploying Extensions ---");
 
         // Deploy KarmaReputationPresale
+        // Note: reputationManager can be set to address(0) initially and configured later via setReputationManager()
         KarmaReputationPresale reputationPresale = new KarmaReputationPresale(
             deployer,
             deployed.karma,
             USDC,
-            teamFeeRecipient
+            teamFeeRecipient,
+            address(0) // reputationManager - set later via setReputationManager()
         );
         deployed.karmaReputationPresale = address(reputationPresale);
         logDeployment("KarmaReputationPresale", deployed.karmaReputationPresale);

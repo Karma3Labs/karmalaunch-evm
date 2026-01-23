@@ -10,14 +10,14 @@ interface IKarmaReputationPresale is IKarmaExtension {
     event PresaleCreated(
         uint256 indexed presaleId,
         address presaleOwner,
-        address scoreUploader,
         uint256 targetUsdc,
         uint256 minUsdc,
         uint256 endTime,
         uint256 scoreUploadDeadline,
         uint256 lockupDuration,
         uint256 vestingDuration,
-        uint256 karmaFeeBps
+        uint256 karmaFeeBps,
+        bytes32 reputationContext
     );
 
     event Contribution(
@@ -67,6 +67,7 @@ interface IKarmaReputationPresale is IKarmaExtension {
     event KarmaFeeUpdatedForPresale(uint256 presaleId, uint256 oldFee, uint256 newFee);
     event MinLockupDurationUpdated(uint256 oldDuration, uint256 newDuration);
     event ScoreUploadBufferUpdated(uint256 oldBuffer, uint256 newBuffer);
+    event ReputationManagerUpdated(address reputationManager);
 
     // ============ Enums ============
 
@@ -86,7 +87,6 @@ interface IKarmaReputationPresale is IKarmaExtension {
         IKarma.DeploymentConfig deploymentConfig;
         // Addresses
         address presaleOwner;
-        address scoreUploader;
         // USDC goals
         uint256 targetUsdc;
         uint256 minUsdc;
@@ -115,7 +115,6 @@ interface IKarmaReputationPresale is IKarmaExtension {
 
     error InvalidPresale();
     error InvalidPresaleOwner();
-    error InvalidScoreUploader();
     error InvalidUsdcGoal();
     error InvalidPresaleDuration();
     error InvalidScoreUploadBuffer();
@@ -129,6 +128,7 @@ interface IKarmaReputationPresale is IKarmaExtension {
     error PresaleNotClaimable();
     error PresaleNotFailed();
     error PresaleSuccessful();
+    error ReputationManagerNotSet();
     error PresaleAlreadyClaimed();
     error PresaleNotReadyForDeployment();
     error PresaleLockupNotPassed();

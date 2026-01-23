@@ -6,6 +6,7 @@ import {Test, console} from "forge-std/Test.sol";
 import {KarmaReputationPresale} from "../contracts/extensions/KarmaReputationPresale.sol";
 import {IKarmaReputationPresale} from "../contracts/extensions/interfaces/IKarmaReputationPresale.sol";
 import {IKarma} from "../contracts/interfaces/IKarma.sol";
+import {ReputationManager} from "../contracts/ReputationManager.sol";
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -41,8 +42,9 @@ contract TestableKarmaReputationPresale is KarmaReputationPresale {
         address owner_,
         address factory_,
         address usdc_,
-        address karmaFeeRecipient_
-    ) KarmaReputationPresale(owner_, factory_, usdc_, karmaFeeRecipient_) {}
+        address karmaFeeRecipient_,
+        address reputationManager_
+    ) KarmaReputationPresale(owner_, factory_, usdc_, karmaFeeRecipient_, reputationManager_) {}
 
     // Test helper to simulate token deployment completion
     function testCompleteDeployment(
@@ -61,11 +63,37 @@ contract TestableKarmaReputationPresale is KarmaReputationPresale {
         presale.tokenSupply = tokenSupply;
         presale.status = PresaleStatus.Claimable;
     }
+
+    // Test helper to force status update
+    function testUpdateStatus(uint256 presaleId) external {
+        Presale storage presale = presaleState[presaleId];
+
+        // Transition from Active to PendingScores or Failed when contribution window ends
+        if (presale.status == PresaleStatus.Active && block.timestamp >= presale.endTime) {
+            if (presale.totalContributions >= presale.minUsdc) {
+                presale.status = PresaleStatus.PendingScores;
+            } else {
+                presale.status = PresaleStatus.Failed;
+            }
+        }
+
+        // Transition from PendingScores to ScoresUploaded if scores are available in ReputationManager
+        if (presale.status == PresaleStatus.PendingScores) {
+            bytes32 context = presaleContext[presaleId];
+            if (address(reputationManager) != address(0) && reputationManager.isFinalized(context)) {
+                presale.totalScore = reputationManager.getTotalScore(context);
+                presale.status = PresaleStatus.ScoresUploaded;
+            } else if (block.timestamp > presale.scoreUploadDeadline) {
+                presale.status = PresaleStatus.Failed;
+            }
+        }
+    }
 }
 
 contract KarmaReputationPresaleTest is Test {
     // Contracts
     TestableKarmaReputationPresale public presale;
+    ReputationManager public reputationManager;
     MockUSDC public usdc;
     MockToken public token;
 
@@ -97,12 +125,19 @@ contract KarmaReputationPresaleTest is Test {
         usdc = new MockUSDC();
         token = new MockToken();
 
+        // Deploy ReputationManager
+        reputationManager = new ReputationManager(owner);
+
+        // Set scoreUploader as a global uploader
+        reputationManager.setGlobalUploader(scoreUploader, true);
+
         // Deploy testable presale extension
         presale = new TestableKarmaReputationPresale(
             owner,
             mockFactory,
             address(usdc),
-            feeRecipient
+            feeRecipient,
+            address(reputationManager)
         );
 
         // Add admin to presale
@@ -129,18 +164,21 @@ contract KarmaReputationPresaleTest is Test {
         // ========== Step 1: Create Presale ==========
         console.log("Step 1: Creating presale...");
 
+        // Generate reputation context for this presale
+        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
+
         IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
 
         vm.prank(admin);
         uint256 presaleId = presale.createPresale(
             presaleOwner,
-            scoreUploader,
             TARGET_USDC,
             MIN_USDC,
             PRESALE_DURATION,
             SCORE_UPLOAD_BUFFER,
             LOCKUP_DURATION,
             VESTING_DURATION,
+            reputationContext,
             deploymentConfig
         );
 
@@ -151,7 +189,6 @@ contract KarmaReputationPresaleTest is Test {
         IKarmaReputationPresale.Presale memory presaleData = presale.getPresale(presaleId);
         assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.Active));
         assertEq(presaleData.presaleOwner, presaleOwner);
-        assertEq(presaleData.scoreUploader, scoreUploader);
         assertEq(presaleData.targetUsdc, TARGET_USDC);
         assertEq(presaleData.minUsdc, MIN_USDC);
 
@@ -184,12 +221,13 @@ contract KarmaReputationPresaleTest is Test {
         assertEq(presaleData.totalContributions, 95_000e6);
         console.log("Total contributions:", presaleData.totalContributions / 1e6, "USDC");
 
-        // ========== Step 3: End Contribution Window & Upload Scores ==========
+        // ========== Step 3: End Contribution Window ==========
         console.log("Step 3: Ending contribution window...");
 
         vm.warp(block.timestamp + PRESALE_DURATION + 1);
 
-        console.log("Step 4: Uploading reputation scores...");
+        // ========== Step 4: Upload Scores to ReputationManager ==========
+        console.log("Step 4: Uploading reputation scores to ReputationManager...");
 
         address[] memory users = new address[](4);
         uint256[] memory scores = new uint256[](4);
@@ -203,13 +241,20 @@ contract KarmaReputationPresaleTest is Test {
         users[3] = diana;
         scores[3] = 500;
 
-        uint256 totalScore = 10000;
-
         vm.prank(scoreUploader);
-        presale.uploadScores(presaleId, users, scores, totalScore);
-        console.log("Scores uploaded. Total score:", totalScore);
+        reputationManager.uploadScores(reputationContext, users, scores);
 
-        // Verify scores
+        // Finalize the context to signal scores are ready
+        vm.prank(scoreUploader);
+        reputationManager.finalizeContext(reputationContext);
+
+        uint256 totalScore = reputationManager.getTotalScore(reputationContext);
+        console.log("Scores uploaded and finalized. Total score:", totalScore);
+
+        // Trigger status update
+        presale.testUpdateStatus(presaleId);
+
+        // Verify scores via presale's getUserScore
         assertEq(presale.getUserScore(presaleId, alice), 5000);
         assertEq(presale.getUserScore(presaleId, bob), 3000);
         assertEq(presale.getUserScore(presaleId, charlie), 1500);
@@ -257,10 +302,7 @@ contract KarmaReputationPresaleTest is Test {
         console.log("Diana claimed tokens. Balance:", token.balanceOf(diana) / 1e18);
 
         // ========== Step 7: Presale Owner Claims USDC ==========
-        // NOTE: Refunds should be claimed after presale owner claims USDC
-        // The contract calculates accepted USDC as min(totalContributions, targetUsdc)
-        // which doesn't account for individual score-based caps
-        console.log("Step 8: Presale owner claiming USDC...");
+        console.log("Step 7: Presale owner claiming USDC...");
 
         uint256 presaleOwnerBefore = usdc.balanceOf(presaleOwner);
         uint256 feeRecipientBefore = usdc.balanceOf(feeRecipient);
@@ -272,8 +314,6 @@ contract KarmaReputationPresaleTest is Test {
         console.log("Fee recipient received:", (usdc.balanceOf(feeRecipient) - feeRecipientBefore) / 1e6, "USDC");
 
         // ========== Step 8: Verify Refund Amounts ==========
-        // Note: In current contract design, refunds can only be claimed if there's USDC remaining
-        // after presale owner claims. This test verifies refund calculations are correct.
         console.log("Step 8: Verifying refund calculations...");
 
         uint256 aliceRefund = presale.getRefundAmount(presaleId, alice);
@@ -286,7 +326,7 @@ contract KarmaReputationPresaleTest is Test {
         console.log("Charlie refund (calculated):", charlieRefund / 1e6, "USDC");
         console.log("Diana refund (calculated):", dianaRefund / 1e6, "USDC");
 
-        // Charlie over-contributed (20k vs 15k max), so should have 5k refund
+        // Charlie over-contributed (20k vs ~15k max), so should have a refund
         assertTrue(charlieRefund > 0, "Charlie should have a refund");
 
         console.log("");
@@ -296,18 +336,20 @@ contract KarmaReputationPresaleTest is Test {
     function test_PresaleWithVesting() public {
         console.log("Testing vesting schedule...");
 
+        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
+
         IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
 
         vm.prank(admin);
         uint256 presaleId = presale.createPresale(
             presaleOwner,
-            scoreUploader,
             TARGET_USDC,
             MIN_USDC,
             PRESALE_DURATION,
             SCORE_UPLOAD_BUFFER,
             LOCKUP_DURATION,
             VESTING_DURATION,
+            reputationContext,
             deploymentConfig
         );
 
@@ -315,16 +357,22 @@ contract KarmaReputationPresaleTest is Test {
         vm.prank(alice);
         presale.contribute(presaleId, 50_000e6);
 
-        // End contribution window and upload scores
+        // End contribution window
         vm.warp(block.timestamp + PRESALE_DURATION + 1);
 
+        // Upload scores to ReputationManager
         address[] memory users = new address[](1);
         uint256[] memory scores = new uint256[](1);
         users[0] = alice;
         scores[0] = 5000;
 
         vm.prank(scoreUploader);
-        presale.uploadScores(presaleId, users, scores, 5000);
+        reputationManager.uploadScores(reputationContext, users, scores);
+        vm.prank(scoreUploader);
+        reputationManager.finalizeContext(reputationContext);
+
+        // Trigger status update
+        presale.testUpdateStatus(presaleId);
 
         // Simulate deployment
         token.mint(address(presale), PRESALE_TOKEN_SUPPLY);
@@ -368,21 +416,23 @@ contract KarmaReputationPresaleTest is Test {
         console.log("All tokens claimed successfully!");
     }
 
-    function test_FailedPresale() public {
+    function test_FailedPresale_BelowMinimum() public {
         console.log("Testing failed presale (below minimum)...");
+
+        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
 
         IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
 
         vm.prank(admin);
         uint256 presaleId = presale.createPresale(
             presaleOwner,
-            scoreUploader,
             TARGET_USDC,
             MIN_USDC,
             PRESALE_DURATION,
             SCORE_UPLOAD_BUFFER,
             LOCKUP_DURATION,
             VESTING_DURATION,
+            reputationContext,
             deploymentConfig
         );
 
@@ -393,35 +443,85 @@ contract KarmaReputationPresaleTest is Test {
         // End contribution window
         vm.warp(block.timestamp + PRESALE_DURATION + 1);
 
-        // Withdraw triggers status update to Failed
+        // Trigger status update - should fail due to below minimum
+        presale.testUpdateStatus(presaleId);
+
+        IKarmaReputationPresale.Presale memory presaleData = presale.getPresale(presaleId);
+        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.Failed));
+        console.log("Presale status: Failed (as expected - below minimum)");
+
+        // Alice should be able to withdraw her contribution
         uint256 aliceUsdcBefore = usdc.balanceOf(alice);
 
         vm.prank(alice);
         presale.withdrawContribution(presaleId, 30_000e6);
 
-        IKarmaReputationPresale.Presale memory presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.Failed));
-        console.log("Presale status: Failed (as expected)");
-
         assertEq(usdc.balanceOf(alice), aliceUsdcBefore + 30_000e6);
         console.log("Alice successfully withdrew contribution from failed presale");
     }
 
-    function test_WithdrawDuringActivePresale() public {
-        console.log("Testing withdrawal during active presale...");
+    function test_FailedPresale_ScoreUploadDeadlinePassed() public {
+        console.log("Testing failed presale (score upload deadline passed)...");
+
+        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
 
         IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
 
         vm.prank(admin);
         uint256 presaleId = presale.createPresale(
             presaleOwner,
-            scoreUploader,
             TARGET_USDC,
             MIN_USDC,
             PRESALE_DURATION,
             SCORE_UPLOAD_BUFFER,
             LOCKUP_DURATION,
             VESTING_DURATION,
+            reputationContext,
+            deploymentConfig
+        );
+
+        // Contribute enough to meet minimum
+        vm.prank(alice);
+        presale.contribute(presaleId, 50_000e6);
+
+        // End contribution window
+        vm.warp(block.timestamp + PRESALE_DURATION + 1);
+
+        // Trigger status update - should be PendingScores
+        presale.testUpdateStatus(presaleId);
+
+        IKarmaReputationPresale.Presale memory presaleData = presale.getPresale(presaleId);
+        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.PendingScores));
+        console.log("Presale status: PendingScores");
+
+        // Pass the score upload deadline without uploading scores
+        vm.warp(presaleData.scoreUploadDeadline + 1);
+
+        // Trigger status update - should fail due to deadline
+        presale.testUpdateStatus(presaleId);
+
+        presaleData = presale.getPresale(presaleId);
+        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.Failed));
+        console.log("Presale status: Failed (as expected - score upload deadline passed)");
+    }
+
+    function test_WithdrawDuringActivePresale() public {
+        console.log("Testing withdrawal during active presale...");
+
+        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
+
+        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
+
+        vm.prank(admin);
+        uint256 presaleId = presale.createPresale(
+            presaleOwner,
+            TARGET_USDC,
+            MIN_USDC,
+            PRESALE_DURATION,
+            SCORE_UPLOAD_BUFFER,
+            LOCKUP_DURATION,
+            VESTING_DURATION,
+            reputationContext,
             deploymentConfig
         );
 
@@ -442,18 +542,20 @@ contract KarmaReputationPresaleTest is Test {
     function test_ScoreBasedAllocation() public {
         console.log("Testing score-based allocation...");
 
+        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
+
         IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
 
         vm.prank(admin);
         uint256 presaleId = presale.createPresale(
             presaleOwner,
-            scoreUploader,
             TARGET_USDC,
             MIN_USDC,
             PRESALE_DURATION,
             SCORE_UPLOAD_BUFFER,
             LOCKUP_DURATION,
             VESTING_DURATION,
+            reputationContext,
             deploymentConfig
         );
 
@@ -469,15 +571,10 @@ contract KarmaReputationPresaleTest is Test {
 
         vm.warp(block.timestamp + PRESALE_DURATION + 1);
 
-        // Upload scores
+        // Upload scores to ReputationManager
         // Score mapping: scores below 1000 get mapped to 1000 (SCORE_MIN)
         // Alice: 5000, Bob: 3000, Charlie: 1500, Diana: 1000 (mapped from 500)
         // Total mapped score: 5000 + 3000 + 1500 + 1000 = 10500
-        // But totalScore passed is the sum of raw scores for the formula
-        // Alice: 5000/10500 = 47.6% of 100k = 47.6k max
-        // Bob: 3000/10500 = 28.6% = 28.6k max
-        // Charlie: 1500/10500 = 14.3% = 14.3k max
-        // Diana: 1000/10500 = 9.5% = 9.5k max
         address[] memory users = new address[](4);
         uint256[] memory scores = new uint256[](4);
         users[0] = alice;
@@ -489,10 +586,15 @@ contract KarmaReputationPresaleTest is Test {
         users[3] = diana;
         scores[3] = 1000; // Use 1000 since scores below SCORE_MIN get mapped to SCORE_MIN
 
-        uint256 totalScore = 5000 + 3000 + 1500 + 1000; // 10500
-
         vm.prank(scoreUploader);
-        presale.uploadScores(presaleId, users, scores, totalScore);
+        reputationManager.uploadScores(reputationContext, users, scores);
+        vm.prank(scoreUploader);
+        reputationManager.finalizeContext(reputationContext);
+
+        uint256 totalScore = reputationManager.getTotalScore(reputationContext);
+
+        // Trigger status update
+        presale.testUpdateStatus(presaleId);
 
         // Check max contributions (based on mapped scores)
         // max = (mappedScore / totalScore) * targetUsdc
@@ -517,14 +619,106 @@ contract KarmaReputationPresaleTest is Test {
         assertEq(presale.getAcceptedContribution(presaleId, diana), dianaMax);
 
         console.log("Score-based allocation working correctly!");
+        console.log("Alice max:", aliceMax / 1e6, "USDC");
+        console.log("Bob max:", bobMax / 1e6, "USDC");
+        console.log("Charlie max:", charlieMax / 1e6, "USDC");
+        console.log("Diana max:", dianaMax / 1e6, "USDC");
+    }
+
+    function test_DefaultScoreForUsersWithNoReputation() public {
+        console.log("Testing default score for users with no reputation...");
+
+        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
+
+        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
+
+        vm.prank(admin);
+        uint256 presaleId = presale.createPresale(
+            presaleOwner,
+            TARGET_USDC,
+            MIN_USDC,
+            PRESALE_DURATION,
+            SCORE_UPLOAD_BUFFER,
+            LOCKUP_DURATION,
+            VESTING_DURATION,
+            reputationContext,
+            deploymentConfig
+        );
+
+        // Alice contributes (has no reputation score)
+        vm.prank(alice);
+        presale.contribute(presaleId, 50_000e6);
+
+        vm.warp(block.timestamp + PRESALE_DURATION + 1);
+
+        // Only upload scores for bob (alice has no score)
+        address[] memory users = new address[](1);
+        uint256[] memory scores = new uint256[](1);
+        users[0] = bob;
+        scores[0] = 5000;
+
+        vm.prank(scoreUploader);
+        reputationManager.uploadScores(reputationContext, users, scores);
+        vm.prank(scoreUploader);
+        reputationManager.finalizeContext(reputationContext);
+
+        // Trigger status update
+        presale.testUpdateStatus(presaleId);
+
+        // Alice should get default score (mapped to SCORE_MIN since default is 500 < 1000)
+        uint256 aliceScore = presale.getUserScore(presaleId, alice);
+        console.log("Alice score (should be 0 from ReputationManager):", aliceScore);
+
+        // The presale should use default score for users with no reputation
+        // Check that getMaxContribution doesn't revert and uses default score mapping
+        uint256 aliceMax = presale.getMaxContribution(presaleId, alice);
+        console.log("Alice max contribution:", aliceMax / 1e6, "USDC");
+    }
+
+    function test_ReputationManagerNotSet() public {
+        console.log("Testing presale creation without ReputationManager...");
+
+        // Deploy presale without ReputationManager
+        TestableKarmaReputationPresale presaleNoRM = new TestableKarmaReputationPresale(
+            owner,
+            mockFactory,
+            address(usdc),
+            feeRecipient,
+            address(0) // No ReputationManager
+        );
+        presaleNoRM.setAdmin(admin, true);
+
+        bytes32 reputationContext = keccak256("test");
+        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfigFor(address(presaleNoRM));
+
+        // Should revert when trying to create presale without ReputationManager
+        vm.prank(admin);
+        vm.expectRevert(IKarmaReputationPresale.ReputationManagerNotSet.selector);
+        presaleNoRM.createPresale(
+            presaleOwner,
+            TARGET_USDC,
+            MIN_USDC,
+            PRESALE_DURATION,
+            SCORE_UPLOAD_BUFFER,
+            LOCKUP_DURATION,
+            VESTING_DURATION,
+            reputationContext,
+            deploymentConfig
+        );
+
+        console.log("Correctly reverted with ReputationManagerNotSet");
     }
 
     // ============ Helper Functions ============
 
     function _createDeploymentConfig() internal view returns (IKarma.DeploymentConfig memory) {
+        return _createDeploymentConfigFor(address(presale));
+    }
+
+    function _createDeploymentConfigFor(address presaleAddr) internal view returns (IKarma.DeploymentConfig memory) {
         IKarma.ExtensionConfig[] memory extensionConfigs = new IKarma.ExtensionConfig[](1);
         extensionConfigs[0] = IKarma.ExtensionConfig({
-            extension: address(presale),
+            extension: presaleAddr,
             msgValue: 0,
             extensionBps: 5000,
             extensionData: ""
