@@ -32,9 +32,11 @@ abstract contract BaseScript is Script {
         address karma;
         address karmaFeeLocker;
         // Hooks
-        address karmaHookStaticFee;
+        address karmaHookStaticFeeV2;
+        address karmaPoolExtensionAllowlist;
         // Extensions
         address karmaReputationPresale;
+        address karmaReputationPresaleV2;
     }
 
     DeployedContracts public deployed;

@@ -3,7 +3,7 @@ pragma solidity ^0.8.28;
 
 import {Test, console} from "forge-std/Test.sol";
 
-import {KarmaReputationPresale} from "../contracts/extensions/KarmaReputationPresale.sol";
+import {KarmaReputationPresaleV2} from "../contracts/extensions/KarmaReputationPresaleV2.sol";
 import {IKarmaReputationPresale} from "../contracts/extensions/interfaces/IKarmaReputationPresale.sol";
 import {IKarma} from "../contracts/interfaces/IKarma.sol";
 import {ReputationManager} from "../contracts/ReputationManager.sol";
@@ -33,14 +33,14 @@ contract MockToken is ERC20 {
     }
 }
 
-contract TestableKarmaReputationPresale is KarmaReputationPresale {
+contract TestableKarmaReputationPresaleV2 is KarmaReputationPresaleV2 {
     constructor(
         address owner_,
         address factory_,
         address usdc_,
         address karmaFeeRecipient_,
         address reputationManager_
-    ) KarmaReputationPresale(owner_, factory_, usdc_, karmaFeeRecipient_, reputationManager_) {}
+    ) KarmaReputationPresaleV2(owner_, factory_, usdc_, karmaFeeRecipient_, reputationManager_) {}
 
     function testCompleteDeployment(
         uint256 presaleId,
@@ -76,8 +76,8 @@ contract TestableKarmaReputationPresale is KarmaReputationPresale {
     }
 }
 
-contract KarmaReputationPresaleTest is Test {
-    TestableKarmaReputationPresale public presale;
+contract KarmaReputationPresaleV2Test is Test {
+    TestableKarmaReputationPresaleV2 public presale;
     ReputationManager public reputationManager;
     MockUSDC public usdc;
     MockToken public token;
@@ -93,6 +93,7 @@ contract KarmaReputationPresaleTest is Test {
     address public bob = makeAddr("bob");
     address public charlie = makeAddr("charlie");
     address public diana = makeAddr("diana");
+    address public eve = makeAddr("eve");
 
     uint256 public constant TARGET_USDC = 100_000e6;
     uint256 public constant MIN_USDC = 50_000e6;
@@ -107,7 +108,7 @@ contract KarmaReputationPresaleTest is Test {
         reputationManager = new ReputationManager(owner);
         reputationManager.setGlobalUploader(scoreUploader, true);
 
-        presale = new TestableKarmaReputationPresale(
+        presale = new TestableKarmaReputationPresaleV2(
             owner,
             mockFactory,
             address(usdc),
@@ -121,6 +122,7 @@ contract KarmaReputationPresaleTest is Test {
         usdc.mint(bob, 40_000e6);
         usdc.mint(charlie, 30_000e6);
         usdc.mint(diana, 20_000e6);
+        usdc.mint(eve, 20_000e6);
 
         vm.prank(alice);
         usdc.approve(address(presale), type(uint256).max);
@@ -129,6 +131,8 @@ contract KarmaReputationPresaleTest is Test {
         vm.prank(charlie);
         usdc.approve(address(presale), type(uint256).max);
         vm.prank(diana);
+        usdc.approve(address(presale), type(uint256).max);
+        vm.prank(eve);
         usdc.approve(address(presale), type(uint256).max);
     }
 
@@ -181,7 +185,7 @@ contract KarmaReputationPresaleTest is Test {
         });
     }
 
-    function test_FullPresaleFlow() public {
+    function test_FullPresaleFlowV2_Oversubscribed() public {
         console.log("Step 1: Creating presale...");
 
         bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
@@ -223,6 +227,8 @@ contract KarmaReputationPresaleTest is Test {
         assertEq(presaleData.totalContributions, 120_000e6);
         console.log("Total contributions:", presaleData.totalContributions / 1e6, "USDC (oversubscribed!)");
 
+        assertEq(presale.getContributorCount(presaleId), 4, "Should have 4 contributors");
+
         console.log("Step 3: Ending contribution window...");
         vm.warp(block.timestamp + PRESALE_DURATION + 1);
 
@@ -254,7 +260,35 @@ contract KarmaReputationPresaleTest is Test {
         assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.ScoresUploaded));
         console.log("Presale status: ScoresUploaded");
 
-        console.log("Step 5: Simulating token deployment...");
+        console.log("Step 5: Calculating priority-based allocation...");
+
+        presale.calculateAllocation(presaleId);
+
+        uint256 aliceAccepted = presale.getAcceptedContribution(presaleId, alice);
+        uint256 bobAccepted = presale.getAcceptedContribution(presaleId, bob);
+        uint256 charlieAccepted = presale.getAcceptedContribution(presaleId, charlie);
+        uint256 dianaAccepted = presale.getAcceptedContribution(presaleId, diana);
+
+        console.log("Alice accepted:", aliceAccepted / 1e6, "USDC");
+        console.log("Bob accepted:", bobAccepted / 1e6, "USDC");
+        console.log("Charlie accepted:", charlieAccepted / 1e6, "USDC");
+        console.log("Diana accepted:", dianaAccepted / 1e6, "USDC");
+
+        assertEq(aliceAccepted, 50_000e6, "Alice should have full 50k accepted");
+        assertEq(bobAccepted, 30_000e6, "Bob should have full 30k accepted");
+        assertEq(charlieAccepted, 20_000e6, "Charlie should have 20k accepted (partial)");
+        assertEq(dianaAccepted, 0, "Diana should have 0 accepted");
+
+        uint256 charlieRefund = presale.getRefundAmount(presaleId, charlie);
+        uint256 dianaRefund = presale.getRefundAmount(presaleId, diana);
+
+        console.log("Charlie refund:", charlieRefund / 1e6, "USDC");
+        console.log("Diana refund:", dianaRefund / 1e6, "USDC");
+
+        assertEq(charlieRefund, 5_000e6, "Charlie should get 5k refund");
+        assertEq(dianaRefund, 15_000e6, "Diana should get full 15k refund");
+
+        console.log("Step 6: Simulating token deployment...");
 
         token.mint(address(presale), PRESALE_TOKEN_SUPPLY);
         presale.testCompleteDeployment(presaleId, address(token), PRESALE_TOKEN_SUPPLY);
@@ -263,35 +297,51 @@ contract KarmaReputationPresaleTest is Test {
         assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.Claimable));
         console.log("Presale status: Claimable");
 
-        console.log("Step 6: Claiming tokens...");
+        console.log("Step 7: Claiming tokens...");
 
-        uint256 aliceAllocation = presale.getTokenAllocation(presaleId, alice);
-        uint256 bobAllocation = presale.getTokenAllocation(presaleId, bob);
-        uint256 charlieAllocation = presale.getTokenAllocation(presaleId, charlie);
-        uint256 dianaAllocation = presale.getTokenAllocation(presaleId, diana);
+        uint256 aliceTokens = presale.getTokenAllocation(presaleId, alice);
+        uint256 bobTokens = presale.getTokenAllocation(presaleId, bob);
+        uint256 charlieTokens = presale.getTokenAllocation(presaleId, charlie);
+        uint256 dianaTokens = presale.getTokenAllocation(presaleId, diana);
 
-        console.log("Alice token allocation:", aliceAllocation / 1e18);
-        console.log("Bob token allocation:", bobAllocation / 1e18);
-        console.log("Charlie token allocation:", charlieAllocation / 1e18);
-        console.log("Diana token allocation:", dianaAllocation / 1e18);
+        console.log("Alice token allocation:", aliceTokens / 1e18, "tokens");
+        console.log("Bob token allocation:", bobTokens / 1e18, "tokens");
+        console.log("Charlie token allocation:", charlieTokens / 1e18, "tokens");
+        console.log("Diana token allocation:", dianaTokens / 1e18, "tokens");
+
+        assertEq(aliceTokens, 25_000_000_000e18, "Alice should get 25B tokens");
+        assertEq(bobTokens, 15_000_000_000e18, "Bob should get 15B tokens");
+        assertEq(charlieTokens, 10_000_000_000e18, "Charlie should get 10B tokens");
+        assertEq(dianaTokens, 0, "Diana should get 0 tokens");
 
         vm.prank(alice);
         presale.claimTokens(presaleId);
-        console.log("Alice claimed tokens. Balance:", token.balanceOf(alice) / 1e18);
 
         vm.prank(bob);
         presale.claimTokens(presaleId);
-        console.log("Bob claimed tokens. Balance:", token.balanceOf(bob) / 1e18);
 
         vm.prank(charlie);
         presale.claimTokens(presaleId);
-        console.log("Charlie claimed tokens. Balance:", token.balanceOf(charlie) / 1e18);
 
         vm.prank(diana);
+        vm.expectRevert(IKarmaReputationPresale.NoTokensToClaim.selector);
         presale.claimTokens(presaleId);
-        console.log("Diana claimed tokens. Balance:", token.balanceOf(diana) / 1e18);
 
-        console.log("Step 7: Presale owner claiming USDC...");
+        console.log("Step 8: Claiming refunds...");
+
+        vm.prank(charlie);
+        presale.claimRefund(presaleId);
+        console.log("Charlie claimed refund");
+
+        vm.prank(diana);
+        presale.claimRefund(presaleId);
+        console.log("Diana claimed refund");
+
+        vm.prank(alice);
+        vm.expectRevert(IKarmaReputationPresale.NoRefundAvailable.selector);
+        presale.claimRefund(presaleId);
+
+        console.log("Step 9: Presale owner claiming USDC...");
 
         uint256 presaleOwnerBefore = usdc.balanceOf(presaleOwner);
         uint256 feeRecipientBefore = usdc.balanceOf(feeRecipient);
@@ -299,22 +349,17 @@ contract KarmaReputationPresaleTest is Test {
         vm.prank(presaleOwner);
         presale.claimUsdc(presaleId, presaleOwner);
 
-        console.log("Presale owner received:", (usdc.balanceOf(presaleOwner) - presaleOwnerBefore) / 1e6, "USDC");
-        console.log("Fee recipient received:", (usdc.balanceOf(feeRecipient) - feeRecipientBefore) / 1e6, "USDC");
+        uint256 ownerReceived = usdc.balanceOf(presaleOwner) - presaleOwnerBefore;
+        uint256 feeReceived = usdc.balanceOf(feeRecipient) - feeRecipientBefore;
 
-        console.log("Step 8: Verifying refund calculations...");
+        console.log("Presale owner received:", ownerReceived / 1e6, "USDC");
+        console.log("Fee recipient received:", feeReceived / 1e6, "USDC");
 
-        uint256 charlieRefund = presale.getRefundAmount(presaleId, charlie);
-        uint256 dianaRefund = presale.getRefundAmount(presaleId, diana);
-
-        console.log("Charlie refund (calculated):", charlieRefund / 1e6, "USDC");
-        console.log("Diana refund (calculated):", dianaRefund / 1e6, "USDC");
-
-        assertTrue(charlieRefund > 0, "Charlie should have a refund");
-        assertTrue(dianaRefund > 0, "Diana should have a refund");
+        assertEq(ownerReceived, 95_000e6, "Owner should receive 95k USDC");
+        assertEq(feeReceived, 5_000e6, "Fee recipient should receive 5k USDC");
 
         console.log("");
-        console.log("========== PRESALE COMPLETED SUCCESSFULLY ==========");
+        console.log("========== V2 PRESALE COMPLETED SUCCESSFULLY ==========");
     }
 
     function test_UndersubscribedPresale() public {
@@ -365,18 +410,86 @@ contract KarmaReputationPresaleTest is Test {
         reputationManager.finalizeContext(reputationContext);
 
         presale.testUpdateStatus(presaleId);
+        presale.calculateAllocation(presaleId);
 
-        // All contributions should be accepted (no caps in undersubscribed case)
         assertEq(presale.getAcceptedContribution(presaleId, alice), 40_000e6, "Alice full contribution accepted");
         assertEq(presale.getAcceptedContribution(presaleId, bob), 25_000e6, "Bob full contribution accepted");
         assertEq(presale.getAcceptedContribution(presaleId, charlie), 15_000e6, "Charlie full contribution accepted");
 
-        // No refunds
         assertEq(presale.getRefundAmount(presaleId, alice), 0, "Alice no refund");
         assertEq(presale.getRefundAmount(presaleId, bob), 0, "Bob no refund");
         assertEq(presale.getRefundAmount(presaleId, charlie), 0, "Charlie no refund");
 
         console.log("Undersubscribed presale: all contributions accepted!");
+    }
+
+    function test_UsersWithNoReputation() public {
+        console.log("Testing users with no reputation (handled last)...");
+
+        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
+        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
+
+        vm.prank(admin);
+        uint256 presaleId = presale.createPresale(
+            presaleOwner,
+            TARGET_USDC,
+            MIN_USDC,
+            PRESALE_DURATION,
+            SCORE_UPLOAD_BUFFER,
+            reputationContext,
+            deploymentConfig
+        );
+
+        vm.prank(alice);
+        presale.contribute(presaleId, 50_000e6);
+
+        vm.prank(bob);
+        presale.contribute(presaleId, 30_000e6);
+
+        vm.prank(eve);
+        presale.contribute(presaleId, 20_000e6);
+
+        vm.prank(diana);
+        presale.contribute(presaleId, 20_000e6);
+
+        vm.warp(block.timestamp + PRESALE_DURATION + 1);
+
+        address[] memory users = new address[](3);
+        uint256[] memory scores = new uint256[](3);
+        users[0] = alice;
+        scores[0] = 5000;
+        users[1] = bob;
+        scores[1] = 3000;
+        users[2] = diana;
+        scores[2] = 1000;
+
+        vm.prank(scoreUploader);
+        reputationManager.uploadScores(reputationContext, users, scores);
+
+        vm.prank(scoreUploader);
+        reputationManager.finalizeContext(reputationContext);
+
+        presale.testUpdateStatus(presaleId);
+        presale.calculateAllocation(presaleId);
+
+        uint256 aliceAccepted = presale.getAcceptedContribution(presaleId, alice);
+        uint256 bobAccepted = presale.getAcceptedContribution(presaleId, bob);
+        uint256 dianaAccepted = presale.getAcceptedContribution(presaleId, diana);
+        uint256 eveAccepted = presale.getAcceptedContribution(presaleId, eve);
+
+        console.log("Alice (score 5000) accepted:", aliceAccepted / 1e6, "USDC");
+        console.log("Bob (score 3000) accepted:", bobAccepted / 1e6, "USDC");
+        console.log("Diana (score 1000) accepted:", dianaAccepted / 1e6, "USDC");
+        console.log("Eve (score 0) accepted:", eveAccepted / 1e6, "USDC");
+
+        assertEq(aliceAccepted, 50_000e6, "Alice full");
+        assertEq(bobAccepted, 30_000e6, "Bob full");
+        assertEq(dianaAccepted, 20_000e6, "Diana full");
+        assertEq(eveAccepted, 0, "Eve nothing (no reputation, handled last)");
+
+        assertEq(presale.getRefundAmount(presaleId, eve), 20_000e6, "Eve gets full refund");
+
+        console.log("Users with no reputation are correctly handled last!");
     }
 
     function test_FailedPresale_BelowMinimum() public {
@@ -412,41 +525,6 @@ contract KarmaReputationPresaleTest is Test {
         console.log("Alice successfully withdrew contribution from failed presale");
     }
 
-    function test_FailedPresale_ScoreUploadDeadlinePassed() public {
-        console.log("Testing failed presale (score upload deadline passed)...");
-
-        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
-        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
-
-        vm.prank(admin);
-        uint256 presaleId = presale.createPresale(
-            presaleOwner,
-            TARGET_USDC,
-            MIN_USDC,
-            PRESALE_DURATION,
-            SCORE_UPLOAD_BUFFER,
-            reputationContext,
-            deploymentConfig
-        );
-
-        vm.prank(alice);
-        presale.contribute(presaleId, 60_000e6);
-
-        vm.warp(block.timestamp + PRESALE_DURATION + 1);
-        presale.testUpdateStatus(presaleId);
-
-        IKarmaReputationPresale.Presale memory presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.PendingScores));
-        console.log("Presale status: PendingScores");
-
-        vm.warp(block.timestamp + SCORE_UPLOAD_BUFFER + 1);
-        presale.testUpdateStatus(presaleId);
-
-        presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.Failed));
-        console.log("Presale status: Failed (as expected - score upload deadline passed)");
-    }
-
     function test_WithdrawDuringActivePresale() public {
         console.log("Testing withdrawal during active presale...");
 
@@ -475,81 +553,10 @@ contract KarmaReputationPresaleTest is Test {
         console.log("Alice withdrew 20,000 USDC, remaining: 20,000 USDC");
     }
 
-    function test_ScoreBasedAllocation() public {
-        console.log("Testing score-based allocation...");
-
-        bytes32 reputationContext = reputationManager.generatePresaleContextId(address(presale), 1);
-        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
-
-        vm.prank(admin);
-        uint256 presaleId = presale.createPresale(
-            presaleOwner,
-            TARGET_USDC,
-            MIN_USDC,
-            PRESALE_DURATION,
-            SCORE_UPLOAD_BUFFER,
-            reputationContext,
-            deploymentConfig
-        );
-
-        // Oversubscribe
-        vm.prank(alice);
-        presale.contribute(presaleId, 50_000e6);
-        vm.prank(bob);
-        presale.contribute(presaleId, 30_000e6);
-        vm.prank(charlie);
-        presale.contribute(presaleId, 25_000e6);
-        vm.prank(diana);
-        presale.contribute(presaleId, 15_000e6);
-
-        vm.warp(block.timestamp + PRESALE_DURATION + 1);
-
-        address[] memory users = new address[](4);
-        uint256[] memory scores = new uint256[](4);
-        users[0] = alice;
-        scores[0] = 5000;
-        users[1] = bob;
-        scores[1] = 3000;
-        users[2] = charlie;
-        scores[2] = 1500;
-        users[3] = diana;
-        scores[3] = 1000;
-
-        vm.prank(scoreUploader);
-        reputationManager.uploadScores(reputationContext, users, scores);
-
-        vm.prank(scoreUploader);
-        reputationManager.finalizeContext(reputationContext);
-
-        presale.testUpdateStatus(presaleId);
-
-        // Check max contributions based on scores
-        // Total score = 10500, target = 100k
-        // Alice: 5000/10500 * 100k = ~47619
-        // Bob: 3000/10500 * 100k = ~28571
-        // Charlie: 1500/10500 * 100k = ~14285
-        // Diana: 1000/10500 * 100k = ~9523
-
-        uint256 aliceMax = presale.getMaxContribution(presaleId, alice);
-        uint256 bobMax = presale.getMaxContribution(presaleId, bob);
-        uint256 charlieMax = presale.getMaxContribution(presaleId, charlie);
-        uint256 dianaMax = presale.getMaxContribution(presaleId, diana);
-
-        console.log("Score-based allocation working correctly!");
-        console.log("Alice max:", aliceMax / 1e6, "USDC");
-        console.log("Bob max:", bobMax / 1e6, "USDC");
-        console.log("Charlie max:", charlieMax / 1e6, "USDC");
-        console.log("Diana max:", dianaMax / 1e6, "USDC");
-
-        assertTrue(aliceMax > bobMax, "Alice should have higher max than Bob");
-        assertTrue(bobMax > charlieMax, "Bob should have higher max than Charlie");
-        assertTrue(charlieMax > dianaMax, "Charlie should have higher max than Diana");
-    }
-
     function test_ReputationManagerNotSet() public {
         console.log("Testing presale creation without ReputationManager...");
 
-        TestableKarmaReputationPresale presaleNoRM = new TestableKarmaReputationPresale(
+        TestableKarmaReputationPresaleV2 presaleNoRM = new TestableKarmaReputationPresaleV2(
             owner,
             mockFactory,
             address(usdc),

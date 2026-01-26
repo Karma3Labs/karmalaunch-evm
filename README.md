@@ -1,5 +1,31 @@
 # Karma Reputation Presale
 
+A presale extension where reputation scores determine max contribution amounts **only when oversubscribed**.
+
+## Behavior
+
+| Scenario | Behavior |
+|----------|----------|
+| Under `minUsdc` raised | Presale fails, users can claim full refunds |
+| Under `targetUsdc` raised | No caps applied, all contributions accepted |
+| Above `targetUsdc` raised | Reputation-based caps applied, excess refunded |
+
+## Score Mapping (when caps apply)
+
+- `SCORE_MIN`: 1,000
+- `SCORE_MAX`: 10,000
+- `SCORE_DEFAULT`: 500 (for users with no reputation)
+
+## Formula (when oversubscribed)
+
+```
+max_contribution = (user_score / total_score) × target_usdc
+accepted = min(contributed, max_contribution)
+tokens = (accepted / total_accepted) × token_supply
+```
+
+---
+
 ```
 ════════════════════════════════════════════════════════════════════════════════════════════════════
                                     FULL PRESALE TIMELINE
@@ -35,35 +61,40 @@ DAY 0-7: CONTRIBUTION WINDOW
 │  │  STEP 2: USERS CONTRIBUTE USDC                          │
 │  └─────────────────────────────────────────────────────────┘
 │
-│     alice   calls presale.contribute(40,000 USDC)
-│             ─► emit Contribution { contributor: alice, amount: 40,000, totalRaised: 40,000 }
+│     alice   calls presale.contribute(50,000 USDC)
+│             ─► emit Contribution { contributor: alice, amount: 50,000, totalRaised: 50,000 }
 │
-│     bob     calls presale.contribute(25,000 USDC)
-│             ─► emit Contribution { contributor: bob, amount: 25,000, totalRaised: 65,000 }
+│     bob     calls presale.contribute(30,000 USDC)
+│             ─► emit Contribution { contributor: bob, amount: 30,000, totalRaised: 80,000 }
 │
-│     charlie calls presale.contribute(20,000 USDC)
-│             ─► emit Contribution { contributor: charlie, amount: 20,000, totalRaised: 85,000 }
+│     charlie calls presale.contribute(25,000 USDC)
+│             ─► emit Contribution { contributor: charlie, amount: 25,000, totalRaised: 105,000 }
 │
-│     diana   calls presale.contribute(10,000 USDC)
-│             ─► emit Contribution { contributor: diana, amount: 10,000, totalRaised: 95,000 }
+│     diana   calls presale.contribute(15,000 USDC)
+│             ─► emit Contribution { contributor: diana, amount: 15,000, totalRaised: 120,000 }
 │
 │     ┌──────────────────────────────────────┐
 │     │  CONTRIBUTIONS SUMMARY               │
 │     │  ────────────────────────────────    │
-│     │  Alice:    40,000 USDC               │
-│     │  Bob:      25,000 USDC               │
-│     │  Charlie:  20,000 USDC               │
-│     │  Diana:    10,000 USDC               │
+│     │  Alice:    50,000 USDC               │
+│     │  Bob:      30,000 USDC               │
+│     │  Charlie:  25,000 USDC               │
+│     │  Diana:    15,000 USDC               │
 │     │  ────────────────────────────────    │
-│     │  TOTAL:    95,000 USDC               │
+│     │  TOTAL:   120,000 USDC               │
+│     │  TARGET:  100,000 USDC               │
+│     │  STATUS:  OVERSUBSCRIBED! ⚠️          │
 │     └──────────────────────────────────────┘
 │
 │
 DAY 7: CONTRIBUTION WINDOW ENDS                                   
 ──────────────────────────────────────────────────────────────────
 │
-│     totalContributions (95,000) >= minUsdc (50,000) ?
+│     totalContributions (120,000) >= minUsdc (50,000) ?
 │     YES ─► Status: PENDING_SCORES
+│
+│     totalContributions (120,000) > targetUsdc (100,000) ?
+│     YES ─► Reputation caps will apply!
 │
 │
 DAY 7-9: SCORE UPLOAD WINDOW                                      
@@ -146,23 +177,31 @@ DAY 9: TOKEN DEPLOYMENT
 │             ─► vestingEndTime: Day 16 + 30 days = Day 46
 │
 │     ┌─────────────────────────────────────────────────────────────────┐
-│     │  ALLOCATION CALCULATION                                         │
+│     │  ALLOCATION CALCULATION (OVERSUBSCRIBED CASE)                   │
 │     │  ───────────────────────────────────────────────────────────    │
 │     │                                                                 │
-│     │  max_contribution = (user_score / total_score) × target_usdc   │
-│     │  accepted = min(contributed, max_contribution)                  │
-│     │  tokens = (accepted / total_accepted) × token_supply           │
+│     │  Since totalContributions (120k) > targetUsdc (100k),           │
+│     │  reputation-based caps are applied:                             │
 │     │                                                                 │
-│     │  ┌─────────┬───────┬─────────┬─────────────┬──────────┬───────┐│
-│     │  │  User   │ Score │ Max     │ Contributed │ Accepted │Refund ││
-│     │  ├─────────┼───────┼─────────┼─────────────┼──────────┼───────┤│
-│     │  │ Alice   │ 5000  │ 50,000  │ 40,000      │ 40,000   │   0   ││
-│     │  │ Bob     │ 3000  │ 30,000  │ 25,000      │ 25,000   │   0   ││
-│     │  │ Charlie │ 1500  │ 15,000  │ 20,000      │ 15,000   │ 5,000 ││
-│     │  │ Diana   │  500  │  5,000  │ 10,000      │  5,000   │ 5,000 ││
-│     │  ├─────────┼───────┼─────────┼─────────────┼──────────┼───────┤│
-│     │  │ TOTAL   │ 10000 │ 100,000 │ 95,000      │ 85,000   │10,000 ││
-│     │  └─────────┴───────┴─────────┴─────────────┴──────────┴───────┘│
+│     │  max_contribution = (user_score / total_score) × target_usdc    │
+│     │  accepted = min(contributed, max_contribution)                  │
+│     │  refund = contributed - accepted                                │
+│     │  tokens = (accepted / target_usdc) × token_supply               │
+│     │                                                                 │
+│     │  ┌─────────┬───────┬─────────┬─────────────┬──────────┬────────┐│
+│     │  │  User   │ Score │ Max     │ Contributed │ Accepted │ Refund ││
+│     │  ├─────────┼───────┼─────────┼─────────────┼──────────┼────────┤│
+│     │  │ Alice   │ 5000  │ 50,000  │ 50,000      │ 50,000   │   0    ││
+│     │  │ Bob     │ 3000  │ 30,000  │ 30,000      │ 30,000   │   0    ││
+│     │  │ Charlie │ 1500  │ 15,000  │ 25,000      │ 15,000   │ 10,000 ││
+│     │  │ Diana   │  500  │  5,000  │ 15,000      │  5,000   │ 10,000 ││
+│     │  ├─────────┼───────┼─────────┼─────────────┼──────────┼────────┤│
+│     │  │ TOTAL   │ 10000 │ 100,000 │ 120,000     │ 100,000  │ 20,000 ││
+│     │  └─────────┴───────┴─────────┴─────────────┴──────────┴────────┘│
+│     │                                                                 │
+│     │  NOTE: If totalContributions <= targetUsdc, NO caps apply!      │
+│     │        All contributions would be accepted in full.             │
+│     │                                                                 │
 │     └─────────────────────────────────────────────────────────────────┘
 │
 │
@@ -203,12 +242,12 @@ DAY 16: LOCKUP ENDS, VESTING BEGINS
 │     ┌──────────────────────────────────────┐
 │     │  USDC DISTRIBUTION                   │
 │     │  ────────────────────────────────    │
-│     │  Total Accepted:  85,000 USDC        │
-│     │  Karma Fee (5%):   4,250 USDC        │
-│     │  To Owner:        80,750 USDC        │
+│     │  Total Accepted: 100,000 USDC        │
+│     │  Karma Fee (5%):   5,000 USDC        │
+│     │  To Owner:        95,000 USDC        │
 │     └──────────────────────────────────────┘
 │
-│             ─► emit UsdcClaimed { recipient: presaleOwner, amount: 80,750, fee: 4,250 }
+│             ─► emit UsdcClaimed { recipient: presaleOwner, amount: 95,000, fee: 5,000 }
 │
 │
 │  ┌─────────────────────────────────────────────────────────┐
@@ -216,10 +255,10 @@ DAY 16: LOCKUP ENDS, VESTING BEGINS
 │  └─────────────────────────────────────────────────────────┘
 │
 │     charlie calls presale.claimRefund(presaleId)
-│             ─► emit RefundClaimed { user: charlie, refundAmount: 5,000 }
+│             ─► emit RefundClaimed { user: charlie, refundAmount: 10,000 }
 │
 │     diana   calls presale.claimRefund(presaleId)
-│             ─► emit RefundClaimed { user: diana, refundAmount: 5,000 }
+│             ─► emit RefundClaimed { user: diana, refundAmount: 10,000 }
 │
 │
 DAY 16-46: VESTING PERIOD                                         
@@ -240,10 +279,10 @@ DAY 46: VESTING COMPLETE
 │     ┌──────────────────────────────────────┐
 │     │  FINAL TOKEN DISTRIBUTION            │
 │     │  ────────────────────────────────    │
-│     │  Alice:   23,529,411,764 tokens      │
-│     │  Bob:     14,705,882,352 tokens      │
-│     │  Charlie:  8,823,529,411 tokens      │
-│     │  Diana:    2,941,176,470 tokens      │
+│     │  Alice:   25,000,000,000 tokens (50%)│
+│     │  Bob:     15,000,000,000 tokens (30%)│
+│     │  Charlie:  7,500,000,000 tokens (15%)│
+│     │  Diana:    2,500,000,000 tokens  (5%)│
 │     └──────────────────────────────────────┘
 │
 │
@@ -251,6 +290,41 @@ DAY 46: VESTING COMPLETE
                                       PRESALE COMPLETE
 ════════════════════════════════════════════════════════════════════════════════════════════════════
 ```
+
+---
+
+## Undersubscribed Example
+
+When `totalContributions <= targetUsdc`, **no reputation caps apply**:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  UNDERSUBSCRIBED CASE (no caps)                                 │
+│  ───────────────────────────────────────────────────────────    │
+│                                                                 │
+│  targetUsdc: 100,000 USDC                                       │
+│  totalContributions: 80,000 USDC                                │
+│                                                                 │
+│  Since 80,000 <= 100,000, ALL contributions accepted as-is:     │
+│                                                                 │
+│  ┌─────────┬─────────────┬──────────┬────────┐                  │
+│  │  User   │ Contributed │ Accepted │ Refund │                  │
+│  ├─────────┼─────────────┼──────────┼────────┤                  │
+│  │ Alice   │ 40,000      │ 40,000   │   0    │                  │
+│  │ Bob     │ 25,000      │ 25,000   │   0    │                  │
+│  │ Charlie │ 10,000      │ 10,000   │   0    │                  │
+│  │ Diana   │  5,000      │  5,000   │   0    │                  │
+│  ├─────────┼─────────────┼──────────┼────────┤                  │
+│  │ TOTAL   │ 80,000      │ 80,000   │   0    │                  │
+│  └─────────┴─────────────┴──────────┴────────┘                  │
+│                                                                 │
+│  Token allocation: (accepted / totalContributions) × supply     │
+│  Everyone gets tokens proportional to their contribution.       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Run Tests
 

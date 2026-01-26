@@ -194,7 +194,7 @@ contract ConfigureKarma is BaseScript {
     function run() external {
         // Load addresses from environment
         address karmaAddress = vm.envAddress("KARMA_ADDRESS");
-        address hookStaticFee = vm.envOr("HOOK_STATIC_FEE", address(0));
+        address hookStaticFeeV2 = vm.envOr("HOOK_STATIC_FEE_V2", address(0));
 
         console.log("=== Configuring Karma ===");
         console.log("Karma:", karmaAddress);
@@ -204,9 +204,9 @@ contract ConfigureKarma is BaseScript {
         Karma karma = Karma(karmaAddress);
 
         // Enable hook if provided
-        if (hookStaticFee != address(0)) {
-            karma.setHook(hookStaticFee, true);
-            console.log("Enabled KarmaHookStaticFee:", hookStaticFee);
+        if (hookStaticFeeV2 != address(0)) {
+            karma.setHook(hookStaticFeeV2, true);
+            console.log("Enabled KarmaHookStaticFeeV2:", hookStaticFeeV2);
         }
 
         stopBroadcast();
