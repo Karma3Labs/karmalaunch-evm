@@ -7,7 +7,7 @@ import {
   parseUnits,
 } from "viem";
 
-import { KarmaReputationPresaleV2Abi } from "./abis/KarmaReputationPresaleV2.js";
+import { KarmaAllocatedPresaleAbi } from "./abis/KarmaAllocatedPresale.js";
 import { ERC20Abi } from "./abis/ERC20.js";
 import {
   type KarmaPresaleSDKConfig,
@@ -74,7 +74,6 @@ type PresaleResultTuple = readonly [
   bigint,
   bigint,
   bigint,
-  bigint,
   Address,
   bigint,
   boolean,
@@ -131,7 +130,7 @@ export class KarmaPresaleSDK {
   async getPresale(presaleId: bigint): Promise<Presale> {
     const result = await this.publicClient.readContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "getPresale",
       args: [presaleId],
     });
@@ -149,8 +148,6 @@ export class KarmaPresaleSDK {
     return {
       presaleId,
       presale,
-      expectedTokenSupply: presale.tokenSupply, // Only known after deployment
-      totalAllocatedTokens: 0n, // No longer tracked separately
       totalAcceptedUsdc,
     };
   }
@@ -190,7 +187,7 @@ export class KarmaPresaleSDK {
   async getContribution(presaleId: bigint, user: Address): Promise<bigint> {
     return this.publicClient.readContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "getContribution",
       args: [presaleId, user],
     });
@@ -199,7 +196,7 @@ export class KarmaPresaleSDK {
   async getTokenAllocation(presaleId: bigint, user: Address): Promise<bigint> {
     return this.publicClient.readContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "getTokenAllocation",
       args: [presaleId, user],
     });
@@ -211,7 +208,7 @@ export class KarmaPresaleSDK {
   ): Promise<bigint> {
     return this.publicClient.readContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "getAcceptedContribution",
       args: [presaleId, user],
     });
@@ -220,7 +217,7 @@ export class KarmaPresaleSDK {
   async getRefundAmount(presaleId: bigint, user: Address): Promise<bigint> {
     return this.publicClient.readContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "getRefundAmount",
       args: [presaleId, user],
     });
@@ -244,8 +241,8 @@ export class KarmaPresaleSDK {
   async getTotalAcceptedUsdc(presaleId: bigint): Promise<bigint> {
     return this.publicClient.readContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
-      functionName: "totalAcceptedUsdc",
+      abi: KarmaAllocatedPresaleAbi,
+      functionName: "getTotalAcceptedUsdc",
       args: [presaleId],
     });
   }
@@ -253,7 +250,7 @@ export class KarmaPresaleSDK {
   async hasClaimedTokens(presaleId: bigint, user: Address): Promise<boolean> {
     return this.publicClient.readContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "tokensClaimed",
       args: [presaleId, user],
     });
@@ -262,7 +259,7 @@ export class KarmaPresaleSDK {
   async hasClaimedRefund(presaleId: bigint, user: Address): Promise<boolean> {
     return this.publicClient.readContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "refundClaimed",
       args: [presaleId, user],
     });
@@ -337,7 +334,7 @@ export class KarmaPresaleSDK {
 
     const hash = await walletClient.writeContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "contribute",
       args: [params.presaleId, params.amount],
       account,
@@ -375,7 +372,7 @@ export class KarmaPresaleSDK {
 
     const hash = await walletClient.writeContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "withdrawContribution",
       args: [params.presaleId, params.amount],
       account,
@@ -421,7 +418,7 @@ export class KarmaPresaleSDK {
 
     const hash = await walletClient.writeContract({
       address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "claim",
       args: [params.presaleId],
       account,
@@ -477,6 +474,25 @@ export class KarmaPresaleSDK {
 
   isPresaleFailed(presale: Presale): boolean {
     return presale.status === PresaleStatus.Failed;
+  }
+
+  isPresaleExpired(presale: Presale): boolean {
+    return presale.status === PresaleStatus.Expired;
+  }
+
+  canWithdraw(presale: Presale): boolean {
+    return (
+      presale.status === PresaleStatus.Active ||
+      presale.status === PresaleStatus.Failed ||
+      presale.status === PresaleStatus.Expired
+    );
+  }
+
+  canSetAllocations(presale: Presale): boolean {
+    return (
+      presale.status === PresaleStatus.PendingAllocation ||
+      presale.status === PresaleStatus.AllocationSet
+    );
   }
 
   getTimeRemaining(presale: Presale): number {
@@ -565,9 +581,8 @@ export class KarmaPresaleSDK {
         targetUsdc: bigint;
         minUsdc: bigint;
         endTime: bigint;
-        scoreUploadDeadline: bigint;
+        allocationDeadline: bigint;
         totalContributions: bigint;
-        totalScore: bigint;
         deployedToken: Address;
         tokenSupply: bigint;
         usdcClaimed: boolean;
@@ -599,9 +614,8 @@ export class KarmaPresaleSDK {
         targetUsdc: r.targetUsdc,
         minUsdc: r.minUsdc,
         endTime: r.endTime,
-        scoreUploadDeadline: r.scoreUploadDeadline,
+        allocationDeadline: r.allocationDeadline,
         totalContributions: r.totalContributions,
-        totalScore: r.totalScore,
         deployedToken: r.deployedToken,
         tokenSupply: r.tokenSupply,
         usdcClaimed: r.usdcClaimed,
@@ -618,9 +632,8 @@ export class KarmaPresaleSDK {
       targetUsdc,
       minUsdc,
       endTime,
-      scoreUploadDeadline,
+      allocationDeadline,
       totalContributions,
-      totalScore,
       deployedToken,
       tokenSupply,
       usdcClaimed,
@@ -656,9 +669,8 @@ export class KarmaPresaleSDK {
       targetUsdc,
       minUsdc,
       endTime,
-      scoreUploadDeadline,
+      allocationDeadline,
       totalContributions,
-      totalScore,
       deployedToken,
       tokenSupply,
       usdcClaimed,

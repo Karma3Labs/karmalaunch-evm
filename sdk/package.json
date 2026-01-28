@@ -1,5 +1,5 @@
 {
-  "name": "karma-presale-sdk",
+  "name": "@karma3labs/presale-sdk-evm",
   "version": "1.0.0",
   "description": "TypeScript SDK for participating in Karma Reputation Presales",
   "main": "dist/index.js",

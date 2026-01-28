@@ -5,11 +5,12 @@ import type { Address, Hash } from "viem";
 export enum PresaleStatus {
   NotCreated = 0,
   Active = 1,
-  PendingScores = 2,
-  ScoresUploaded = 3,
+  PendingAllocation = 2,
+  AllocationSet = 3,
   ReadyForDeployment = 4,
-  Failed = 5,
-  Claimable = 6,
+  Claimable = 5,
+  Failed = 6,
+  Expired = 7,
 }
 
 // ============ Config Types ============
@@ -73,9 +74,8 @@ export interface Presale {
   targetUsdc: bigint;
   minUsdc: bigint;
   endTime: bigint;
-  scoreUploadDeadline: bigint;
+  allocationDeadline: bigint;
   totalContributions: bigint;
-  totalScore: bigint;
   deployedToken: Address;
   tokenSupply: bigint;
   usdcClaimed: boolean;
@@ -85,8 +85,6 @@ export interface Presale {
 export interface PresaleInfo {
   presaleId: bigint;
   presale: Presale;
-  expectedTokenSupply: bigint;
-  totalAllocatedTokens: bigint;
   totalAcceptedUsdc: bigint;
 }
 
@@ -119,11 +117,16 @@ export interface ClaimParams {
 
 // ============ Admin Types ============
 
-export interface UploadAllocationParams {
+export interface SetMaxAcceptedUsdcParams {
   presaleId: bigint;
   user: Address;
-  tokenAmount: bigint;
-  acceptedUsdc: bigint;
+  maxUsdc: bigint;
+}
+
+export interface BatchSetMaxAcceptedUsdcParams {
+  presaleId: bigint;
+  users: Address[];
+  maxUsdcAmounts: bigint[];
 }
 
 export interface PrepareDeploymentParams {
@@ -138,11 +141,56 @@ export interface ClaimUsdcParams {
 
 // ============ Event Types ============
 
+export interface PresaleCreatedEvent {
+  presaleId: bigint;
+  presaleOwner: Address;
+  targetUsdc: bigint;
+  minUsdc: bigint;
+  endTime: bigint;
+  allocationDeadline: bigint;
+  karmaFeeBps: bigint;
+  transactionHash: Hash;
+  blockNumber: bigint;
+}
+
 export interface ContributionEvent {
   presaleId: bigint;
   contributor: Address;
   amount: bigint;
-  totalRaised: bigint;
+  totalContributions: bigint;
+  transactionHash: Hash;
+  blockNumber: bigint;
+}
+
+export interface ContributionWithdrawnEvent {
+  presaleId: bigint;
+  contributor: Address;
+  amount: bigint;
+  totalContributions: bigint;
+  transactionHash: Hash;
+  blockNumber: bigint;
+}
+
+export interface MaxAcceptedUsdcSetEvent {
+  presaleId: bigint;
+  user: Address;
+  maxUsdc: bigint;
+  acceptedUsdc: bigint;
+  transactionHash: Hash;
+  blockNumber: bigint;
+}
+
+export interface PresaleReadyForDeploymentEvent {
+  presaleId: bigint;
+  salt: Hash;
+  transactionHash: Hash;
+  blockNumber: bigint;
+}
+
+export interface TokensReceivedEvent {
+  presaleId: bigint;
+  token: Address;
+  tokenSupply: bigint;
   transactionHash: Hash;
   blockNumber: bigint;
 }
@@ -163,10 +211,11 @@ export interface RefundClaimedEvent {
   blockNumber: bigint;
 }
 
-export interface AllocationUploadedEvent {
+export interface UsdcClaimedEvent {
   presaleId: bigint;
-  user: Address;
-  tokenAmount: bigint;
+  recipient: Address;
+  amount: bigint;
+  fee: bigint;
   transactionHash: Hash;
   blockNumber: bigint;
 }
@@ -199,7 +248,7 @@ export class PresaleSDKError extends Error {
   constructor(
     message: string,
     public readonly code: string,
-    public readonly cause?: unknown
+    public readonly cause?: unknown,
   ) {
     super(message);
     this.name = "PresaleSDKError";
@@ -210,7 +259,7 @@ export class InsufficientBalanceError extends PresaleSDKError {
   constructor(required: bigint, available: bigint) {
     super(
       `Insufficient balance: required ${required}, available ${available}`,
-      "INSUFFICIENT_BALANCE"
+      "INSUFFICIENT_BALANCE",
     );
   }
 }
@@ -219,7 +268,7 @@ export class InsufficientAllowanceError extends PresaleSDKError {
   constructor(required: bigint, allowance: bigint) {
     super(
       `Insufficient allowance: required ${required}, current allowance ${allowance}`,
-      "INSUFFICIENT_ALLOWANCE"
+      "INSUFFICIENT_ALLOWANCE",
     );
   }
 }
@@ -228,7 +277,7 @@ export class PresaleNotActiveError extends PresaleSDKError {
   constructor(presaleId: bigint, status: PresaleStatus) {
     super(
       `Presale ${presaleId} is not active. Current status: ${PresaleStatus[status]}`,
-      "PRESALE_NOT_ACTIVE"
+      "PRESALE_NOT_ACTIVE",
     );
   }
 }
@@ -237,7 +286,25 @@ export class PresaleNotClaimableError extends PresaleSDKError {
   constructor(presaleId: bigint, status: PresaleStatus) {
     super(
       `Presale ${presaleId} is not claimable. Current status: ${PresaleStatus[status]}`,
-      "PRESALE_NOT_CLAIMABLE"
+      "PRESALE_NOT_CLAIMABLE",
+    );
+  }
+}
+
+export class PresaleExpiredError extends PresaleSDKError {
+  constructor(presaleId: bigint) {
+    super(
+      `Presale ${presaleId} has expired without deployment`,
+      "PRESALE_EXPIRED",
+    );
+  }
+}
+
+export class PresaleFailedError extends PresaleSDKError {
+  constructor(presaleId: bigint, totalContributions: bigint, minUsdc: bigint) {
+    super(
+      `Presale ${presaleId} failed: raised ${totalContributions}, minimum was ${minUsdc}`,
+      "PRESALE_FAILED",
     );
   }
 }

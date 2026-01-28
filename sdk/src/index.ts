@@ -27,15 +27,21 @@ export {
   type TransactionReceipt,
 
   // Admin types
-  type UploadAllocationParams,
+  type SetMaxAcceptedUsdcParams,
+  type BatchSetMaxAcceptedUsdcParams,
   type PrepareDeploymentParams,
   type ClaimUsdcParams,
 
   // Event types
+  type PresaleCreatedEvent,
   type ContributionEvent,
+  type ContributionWithdrawnEvent,
+  type MaxAcceptedUsdcSetEvent,
+  type PresaleReadyForDeploymentEvent,
+  type TokensReceivedEvent,
   type TokensClaimedEvent,
   type RefundClaimedEvent,
-  type AllocationUploadedEvent,
+  type UsdcClaimedEvent,
 
   // SDK config
   type KarmaPresaleSDKConfig,
@@ -46,8 +52,10 @@ export {
   InsufficientAllowanceError,
   PresaleNotActiveError,
   PresaleNotClaimableError,
+  PresaleExpiredError,
+  PresaleFailedError,
 } from "./types.js";
 
 // ABIs
-export { KarmaReputationPresaleV2Abi } from "./abis/KarmaReputationPresaleV2.js";
+export { KarmaAllocatedPresaleAbi } from "./abis/KarmaAllocatedPresale.js";
 export { ERC20Abi } from "./abis/ERC20.js";

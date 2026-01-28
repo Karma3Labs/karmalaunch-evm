@@ -35,8 +35,7 @@ abstract contract BaseScript is Script {
         address karmaHookStaticFeeV2;
         address karmaPoolExtensionAllowlist;
         // Extensions
-        address karmaReputationPresale;
-        address karmaReputationPresaleV2;
+        address karmaAllocatedPresale;
     }
 
     DeployedContracts public deployed;
@@ -78,7 +77,7 @@ abstract contract BaseScript is Script {
         vm.serializeAddress(json, "karmaFeeLocker", deployed.karmaFeeLocker);
 
         // Extensions
-        string memory finalJson = vm.serializeAddress(json, "karmaReputationPresale", deployed.karmaReputationPresale);
+        string memory finalJson = vm.serializeAddress(json, "karmaAllocatedPresale", deployed.karmaAllocatedPresale);
 
         vm.writeJson(finalJson, string.concat("./deployments/", filename, ".json"));
         console.log("Deployment saved to:", string.concat("./deployments/", filename, ".json"));

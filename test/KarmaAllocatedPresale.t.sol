@@ -3,8 +3,8 @@ pragma solidity ^0.8.28;
 
 import {Test, console} from "forge-std/Test.sol";
 
-import {KarmaReputationPresaleV2} from "../contracts/extensions/KarmaReputationPresaleV2.sol";
-import {IKarmaReputationPresale} from "../contracts/extensions/interfaces/IKarmaReputationPresale.sol";
+import {KarmaAllocatedPresale} from "../contracts/extensions/KarmaAllocatedPresale.sol";
+import {IKarmaAllocatedPresale} from "../contracts/extensions/interfaces/IKarmaAllocatedPresale.sol";
 import {IKarma} from "../contracts/interfaces/IKarma.sol";
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
@@ -29,13 +29,13 @@ contract MockToken is ERC20 {
     }
 }
 
-contract TestableKarmaReputationPresaleV2 is KarmaReputationPresaleV2 {
+contract TestableKarmaAllocatedPresale is KarmaAllocatedPresale {
     constructor(
         address owner_,
         address factory_,
         address usdc_,
         address karmaFeeRecipient_
-    ) KarmaReputationPresaleV2(owner_, factory_, usdc_, karmaFeeRecipient_) {}
+    ) KarmaAllocatedPresale(owner_, factory_, usdc_, karmaFeeRecipient_) {}
 
     function testCompleteDeployment(
         uint256 presaleId,
@@ -59,8 +59,8 @@ contract TestableKarmaReputationPresaleV2 is KarmaReputationPresaleV2 {
     }
 }
 
-contract KarmaReputationPresaleV2Test is Test {
-    TestableKarmaReputationPresaleV2 public presale;
+contract KarmaAllocatedPresaleTest is Test {
+    TestableKarmaAllocatedPresale public presale;
     MockUSDC public usdc;
     MockToken public token;
 
@@ -84,7 +84,7 @@ contract KarmaReputationPresaleV2Test is Test {
         usdc = new MockUSDC();
         token = new MockToken();
 
-        presale = new TestableKarmaReputationPresaleV2(
+        presale = new TestableKarmaAllocatedPresale(
             owner,
             mockFactory,
             address(usdc),
@@ -192,17 +192,17 @@ contract KarmaReputationPresaleV2Test is Test {
         presale.contribute(presaleId, 15_000e6);
         console.log("Diana contributed: 15,000 USDC");
 
-        IKarmaReputationPresale.Presale memory presaleData = presale.getPresale(presaleId);
+        IKarmaAllocatedPresale.Presale memory presaleData = presale.getPresale(presaleId);
         assertEq(presaleData.totalContributions, 120_000e6);
         console.log("Total contributions:", presaleData.totalContributions / 1e6, "USDC (oversubscribed!)");
 
         console.log("Step 3: Ending contribution window...");
         vm.warp(block.timestamp + PRESALE_DURATION + 1);
 
-        // Status is computed dynamically - no need to call testUpdateStatus
+        // Status is computed dynamically based on timestamps and state
         presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.PendingScores));
-        console.log("Presale status: PendingScores");
+        assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.PendingAllocation));
+        console.log("Presale status: PendingAllocation");
 
         console.log("Step 4: Setting max accepted USDC (priority-based: Alice > Bob > Charlie > Diana)...");
 
@@ -225,11 +225,11 @@ contract KarmaReputationPresaleV2Test is Test {
         vm.prank(admin);
         presale.setMaxAcceptedUsdc(presaleId, diana, 0);
 
-        console.log("Max accepted USDC set. Total accepted:", presale.totalAcceptedUsdc(presaleId) / 1e6, "USDC");
-        assertEq(presale.totalAcceptedUsdc(presaleId), 100_000e6, "Total accepted should be 100k USDC");
+        console.log("Max accepted USDC set. Total accepted:", presale.getTotalAcceptedUsdc(presaleId) / 1e6, "USDC");
+        assertEq(presale.getTotalAcceptedUsdc(presaleId), 100_000e6, "Total accepted should be 100k USDC");
 
         presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.ScoresUploaded));
+        assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.AllocationSet));
 
         console.log("Step 5: Preparing for deployment...");
 
@@ -237,7 +237,7 @@ contract KarmaReputationPresaleV2Test is Test {
         presale.prepareForDeployment(presaleId, bytes32(uint256(1)));
 
         presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.ReadyForDeployment));
+        assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.ReadyForDeployment));
         console.log("Presale status: ReadyForDeployment");
 
         console.log("Step 6: Simulating token deployment...");
@@ -246,7 +246,7 @@ contract KarmaReputationPresaleV2Test is Test {
         presale.testCompleteDeployment(presaleId, address(token), PRESALE_TOKEN_SUPPLY);
 
         presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.Claimable));
+        assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.Claimable));
         console.log("Presale status: Claimable");
 
         console.log("Step 7: Claiming tokens...");
@@ -312,7 +312,7 @@ contract KarmaReputationPresaleV2Test is Test {
 
         // Alice trying to claim again should fail
         vm.prank(alice);
-        vm.expectRevert(IKarmaReputationPresale.NoTokensToClaim.selector);
+        vm.expectRevert(IKarmaAllocatedPresale.NothingToClaim.selector);
         presale.claim(presaleId);
         console.log("Alice cannot claim again (expected)");
 
@@ -358,7 +358,7 @@ contract KarmaReputationPresaleV2Test is Test {
         vm.prank(bob);
         presale.contribute(presaleId, 30_000e6);
 
-        IKarmaReputationPresale.Presale memory presaleData = presale.getPresale(presaleId);
+        IKarmaAllocatedPresale.Presale memory presaleData = presale.getPresale(presaleId);
         assertEq(presaleData.totalContributions, 70_000e6, "Total should be 70k USDC");
 
         // End presale
@@ -375,7 +375,7 @@ contract KarmaReputationPresaleV2Test is Test {
         vm.prank(admin);
         presale.setMaxAcceptedUsdc(presaleId, bob, 30_000e6);
 
-        assertEq(presale.totalAcceptedUsdc(presaleId), 70_000e6);
+        assertEq(presale.getTotalAcceptedUsdc(presaleId), 70_000e6);
 
         // Prepare for deployment
         vm.prank(presaleOwner);
@@ -433,8 +433,8 @@ contract KarmaReputationPresaleV2Test is Test {
         vm.warp(block.timestamp + PRESALE_DURATION + 1);
 
         // Status is computed dynamically based on timestamps and totalContributions
-        IKarmaReputationPresale.Presale memory presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaReputationPresale.PresaleStatus.Failed));
+        IKarmaAllocatedPresale.Presale memory presaleData = presale.getPresale(presaleId);
+        assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.Failed));
 
         // Alice can withdraw her contribution
         uint256 aliceBefore = usdc.balanceOf(alice);
@@ -497,7 +497,11 @@ contract KarmaReputationPresaleV2Test is Test {
         // Try to prepare for deployment without setting any max accepted USDC
         // Should fail because totalAcceptedUsdc is 0
         vm.prank(presaleOwner);
-        vm.expectRevert(IKarmaReputationPresale.PresaleNotScoresUploaded.selector);
+        vm.expectRevert(abi.encodeWithSelector(
+            IKarmaAllocatedPresale.InvalidPresaleStatus.selector,
+            IKarmaAllocatedPresale.PresaleStatus.PendingAllocation,
+            IKarmaAllocatedPresale.PresaleStatus.AllocationSet
+        ));
         presale.prepareForDeployment(presaleId, bytes32(uint256(1)));
 
         // Now set max accepted USDC
@@ -534,14 +538,14 @@ contract KarmaReputationPresaleV2Test is Test {
         vm.prank(admin);
         presale.setMaxAcceptedUsdc(presaleId, alice, 60_000e6);
 
-        assertEq(presale.totalAcceptedUsdc(presaleId), 60_000e6);
+        assertEq(presale.getTotalAcceptedUsdc(presaleId), 60_000e6);
         assertEq(presale.getAcceptedContribution(presaleId, alice), 60_000e6);
 
         // Update max accepted USDC
         vm.prank(admin);
         presale.setMaxAcceptedUsdc(presaleId, alice, 100_000e6);
 
-        assertEq(presale.totalAcceptedUsdc(presaleId), 100_000e6);
+        assertEq(presale.getTotalAcceptedUsdc(presaleId), 100_000e6);
         assertEq(presale.getAcceptedContribution(presaleId, alice), 100_000e6);
 
         console.log("Max accepted USDC update test completed");

@@ -3,7 +3,7 @@ pragma solidity ^0.8.28;
 
 import {IKarma} from "../interfaces/IKarma.sol";
 import {IKarmaExtension} from "../interfaces/IKarmaExtension.sol";
-import {IKarmaReputationPresale} from "./interfaces/IKarmaReputationPresale.sol";
+import {IKarmaAllocatedPresale} from "./interfaces/IKarmaAllocatedPresale.sol";
 
 import {OwnerAdmins} from "../utils/OwnerAdmins.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -12,7 +12,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 /**
- * @title KarmaReputationPresaleV2
+ * @title KarmaAllocatedPresale
  * @notice A presale extension where maxAcceptedUsdc is set per user by admin.
  *
  * Key design:
@@ -21,15 +21,12 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
  *   - User's token allocation = (acceptedUsdc / totalAcceptedUsdc) * tokenSupply
  *   - User's refund = contribution - min(contribution, maxAcceptedUsdc)
  *
- * State is determined by timestamps and on-chain data:
- *   - Active: block.timestamp < endTime
- *   - Failed: block.timestamp >= endTime && totalContributions < minUsdc
- *   - PendingAllocation: presale ended, minimum met, waiting for allocation uploads
- *   - AllocationUploaded: some allocations set
- *   - ReadyForDeployment: salt has been set, waiting for factory
- *   - Claimable: deployedToken != address(0)
+ * Status Flow:
+ *   NotCreated -> Active -> PendingAllocation -> AllocationSet -> ReadyForDeployment -> Claimable
+ *                        -> Failed (if min not met)
+ *                                             -> Expired (if deadline passed)
  */
-contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, OwnerAdmins {
+contract KarmaAllocatedPresale is ReentrancyGuard, IKarmaAllocatedPresale, OwnerAdmins {
     using SafeERC20 for IERC20;
 
     // ============ Constants ============
@@ -37,7 +34,7 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
     uint256 public constant BPS = 10_000;
     uint256 public constant MAX_PRESALE_DURATION = 6 weeks;
     uint256 public constant SALT_SET_BUFFER = 1 days;
-    uint256 public constant DEPLOYMENT_BAD_BUFFER = 3 days;
+    uint256 public constant ALLOCATION_DEADLINE_BUFFER = 3 days;
 
     // ============ Immutables ============
 
@@ -62,12 +59,7 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
     mapping(uint256 => uint256) public totalAcceptedUsdc;
 
     // State tracking
-    mapping(uint256 => bool) public readyForDeployment;
-    mapping(uint256 => bool) public allocationComplete;
-
-    // ============ Events ============
-
-    event MaxAcceptedUsdcSet(uint256 indexed presaleId, address indexed user, uint256 maxUsdc, uint256 acceptedUsdc);
+    mapping(uint256 => bool) public saltSet;
 
     // ============ Modifiers ============
 
@@ -77,7 +69,13 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
     }
 
     modifier presaleExists(uint256 presaleId) {
-        if (presaleState[presaleId].targetUsdc == 0) revert InvalidPresale();
+        if (_getStatus(presaleId) == PresaleStatus.NotCreated) revert InvalidPresale();
+        _;
+    }
+
+    modifier onlyStatus(uint256 presaleId, PresaleStatus expected) {
+        PresaleStatus current = _getStatus(presaleId);
+        if (current != expected) revert InvalidPresaleStatus(current, expected);
         _;
     }
 
@@ -96,67 +94,63 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         karmaDefaultFeeBps = 500;
     }
 
-    // ============ Internal State Helpers ============
+    // ============ Status Functions ============
 
     function _getStatus(uint256 presaleId) internal view returns (PresaleStatus) {
         Presale storage presale = presaleState[presaleId];
 
+        // Not created
         if (presale.targetUsdc == 0) {
             return PresaleStatus.NotCreated;
         }
 
-        // If token is deployed, presale is claimable
+        // Claimable - token has been deployed
         if (presale.deployedToken != address(0)) {
             return PresaleStatus.Claimable;
         }
 
-        // If ready for deployment flag is set
-        if (readyForDeployment[presaleId]) {
+        // Ready for deployment - salt has been set
+        if (saltSet[presaleId]) {
             return PresaleStatus.ReadyForDeployment;
         }
 
-        // If still in contribution window
+        // Active - contribution window is open
         if (block.timestamp < presale.endTime) {
             return PresaleStatus.Active;
         }
 
-        // Contribution window has ended
-        // Check if minimum was met
+        // Contribution window ended - check if minimum was met
         if (presale.totalContributions < presale.minUsdc) {
             return PresaleStatus.Failed;
         }
 
-        // Minimum was met, check allocation progress
-        if (totalAcceptedUsdc[presaleId] == 0) {
-            return PresaleStatus.PendingScores;
+        // Check if allocation deadline has passed
+        if (block.timestamp > presale.allocationDeadline) {
+            return PresaleStatus.Expired;
         }
 
-        // Some allocations have been set
-        return PresaleStatus.ScoresUploaded;
+        // Minimum was met, check allocation progress
+        if (totalAcceptedUsdc[presaleId] == 0) {
+            return PresaleStatus.PendingAllocation;
+        }
+
+        // Allocations have been set
+        return PresaleStatus.AllocationSet;
     }
 
-    function _isActive(uint256 presaleId) internal view returns (bool) {
-        return _getStatus(presaleId) == PresaleStatus.Active;
+    function _requireStatus(uint256 presaleId, PresaleStatus expected) internal view {
+        PresaleStatus current = _getStatus(presaleId);
+        if (current != expected) revert InvalidPresaleStatus(current, expected);
     }
 
-    function _isFailed(uint256 presaleId) internal view returns (bool) {
-        Presale storage presale = presaleState[presaleId];
-
-        if (presale.deployedToken != address(0)) return false;
-        if (block.timestamp < presale.endTime) return false;
-        if (presale.totalContributions >= presale.minUsdc) return false;
-
-        return true;
+    function _requireStatusOneOf(uint256 presaleId, PresaleStatus status1, PresaleStatus status2) internal view {
+        PresaleStatus current = _getStatus(presaleId);
+        if (current != status1 && current != status2) {
+            revert InvalidPresaleStatus(current, status1);
+        }
     }
 
-    function _canSetAllocations(uint256 presaleId) internal view returns (bool) {
-        PresaleStatus status = _getStatus(presaleId);
-        return status == PresaleStatus.PendingScores || status == PresaleStatus.ScoresUploaded;
-    }
-
-    function _isClaimable(uint256 presaleId) internal view returns (bool) {
-        return presaleState[presaleId].deployedToken != address(0);
-    }
+    // ============ Internal Helpers ============
 
     function _getAcceptedUsdc(uint256 presaleId, address user) internal view returns (uint256) {
         uint256 contributed = contributions[presaleId][user];
@@ -200,7 +194,7 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         onlyOwnerOrAdmin
     {
         if (newFeeBps > BPS) revert InvalidKarmaFee();
-        if (!_isActive(presaleId)) revert PresaleNotActive();
+        _requireStatus(presaleId, PresaleStatus.Active);
 
         Presale storage presale = presaleState[presaleId];
         uint256 oldFee = presale.karmaFeeBps;
@@ -244,7 +238,7 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         presale.targetUsdc = targetUsdc;
         presale.minUsdc = minUsdc;
         presale.endTime = block.timestamp + duration;
-        presale.scoreUploadDeadline = presale.endTime + DEPLOYMENT_BAD_BUFFER;
+        presale.allocationDeadline = presale.endTime + ALLOCATION_DEADLINE_BUFFER;
         presale.karmaFeeBps = karmaDefaultFeeBps;
         presale.deploymentConfig = deploymentConfig;
 
@@ -254,9 +248,8 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
             targetUsdc,
             minUsdc,
             presale.endTime,
-            presale.scoreUploadDeadline,
-            presale.karmaFeeBps,
-            bytes32(presaleId)
+            presale.allocationDeadline,
+            presale.karmaFeeBps
         );
     }
 
@@ -265,11 +258,10 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
     function contribute(uint256 presaleId, uint256 amount)
         external
         presaleExists(presaleId)
+        onlyStatus(presaleId, PresaleStatus.Active)
         nonReentrant
     {
         Presale storage presale = presaleState[presaleId];
-
-        if (block.timestamp >= presale.endTime) revert ContributionWindowEnded();
 
         usdc.safeTransferFrom(msg.sender, address(this), amount);
 
@@ -284,13 +276,18 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         presaleExists(presaleId)
         nonReentrant
     {
-        Presale storage presale = presaleState[presaleId];
+        PresaleStatus status = _getStatus(presaleId);
 
-        // Can withdraw if active or failed
-        bool canWithdraw = _isActive(presaleId) || _isFailed(presaleId);
-        if (!canWithdraw) revert PresaleSuccessful();
+        // Can withdraw if Active, Failed, or Expired
+        if (status != PresaleStatus.Active &&
+            status != PresaleStatus.Failed &&
+            status != PresaleStatus.Expired) {
+            revert PresaleNotActive();
+        }
 
         if (contributions[presaleId][msg.sender] < amount) revert InsufficientBalance();
+
+        Presale storage presale = presaleState[presaleId];
 
         contributions[presaleId][msg.sender] -= amount;
         presale.totalContributions -= amount;
@@ -302,18 +299,12 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
 
     // ============ Allocation Setting ============
 
-    /// @notice Set the maximum accepted USDC for a user
-    /// @param presaleId The presale ID
-    /// @param user The user address
-    /// @param maxUsdc The maximum USDC that will be accepted from this user
     function setMaxAcceptedUsdc(uint256 presaleId, address user, uint256 maxUsdc)
         external
         presaleExists(presaleId)
         onlyOwnerOrAdmin
     {
-        if (!_canSetAllocations(presaleId)) {
-            revert PresaleNotScoresUploaded();
-        }
+        _requireStatusOneOf(presaleId, PresaleStatus.PendingAllocation, PresaleStatus.AllocationSet);
 
         // Remove previous accepted amount from total
         uint256 previousAccepted = _getAcceptedUsdc(presaleId, user);
@@ -327,19 +318,14 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         emit MaxAcceptedUsdcSet(presaleId, user, maxUsdc, newAccepted);
     }
 
-    /// @notice Batch set maxAcceptedUsdc for multiple users
-    /// @param presaleId The presale ID
-    /// @param users Array of user addresses
-    /// @param maxUsdcAmounts Array of max USDC amounts
     function batchSetMaxAcceptedUsdc(
         uint256 presaleId,
         address[] calldata users,
         uint256[] calldata maxUsdcAmounts
     ) external presaleExists(presaleId) onlyOwnerOrAdmin {
-        if (!_canSetAllocations(presaleId)) {
-            revert PresaleNotScoresUploaded();
-        }
-        require(users.length == maxUsdcAmounts.length, "Length mismatch");
+        _requireStatusOneOf(presaleId, PresaleStatus.PendingAllocation, PresaleStatus.AllocationSet);
+
+        if (users.length != maxUsdcAmounts.length) revert LengthMismatch();
 
         for (uint256 i = 0; i < users.length; i++) {
             address user = users[i];
@@ -358,60 +344,39 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         }
     }
 
-    /// @notice Mark allocation as complete - no more changes allowed
-    function finalizeAllocation(uint256 presaleId)
-        external
-        presaleExists(presaleId)
-        onlyOwnerOrAdmin
-    {
-        if (_getStatus(presaleId) != PresaleStatus.ScoresUploaded) {
-            revert PresaleNotScoresUploaded();
-        }
-        allocationComplete[presaleId] = true;
-    }
-
     // ============ Deployment ============
 
     function prepareForDeployment(uint256 presaleId, bytes32 salt)
         external
         presaleExists(presaleId)
     {
+        _requireStatus(presaleId, PresaleStatus.AllocationSet);
+
         Presale storage presale = presaleState[presaleId];
 
-        // Must have allocations set
-        if (_getStatus(presaleId) != PresaleStatus.ScoresUploaded) revert PresaleNotScoresUploaded();
-
         // Must have some accepted USDC
-        if (totalAcceptedUsdc[presaleId] == 0) revert PresaleNotScoresUploaded();
+        if (totalAcceptedUsdc[presaleId] == 0) revert InsufficientContribution();
 
-        if (block.timestamp > presale.scoreUploadDeadline + DEPLOYMENT_BAD_BUFFER) {
-            revert DeploymentBufferExpired();
-        }
-
+        // Only presale owner can set salt immediately, others must wait
         if (msg.sender != presale.presaleOwner && block.timestamp < presale.endTime + SALT_SET_BUFFER) {
             revert SaltBufferNotExpired();
         }
 
         presale.deploymentConfig.tokenConfig.salt = salt;
-        readyForDeployment[presaleId] = true;
+        saltSet[presaleId] = true;
 
-        emit PresaleReadyForDeployment(presaleId);
+        emit PresaleReadyForDeployment(presaleId, salt);
     }
 
     // ============ Claim Functions ============
 
-    /// @notice Claim both tokens and refund in a single transaction
-    /// @param presaleId The presale ID to claim from
-    /// @return tokenAmount The amount of tokens claimed
-    /// @return refundAmount The amount of USDC refunded
     function claim(uint256 presaleId)
         external
         presaleExists(presaleId)
+        onlyStatus(presaleId, PresaleStatus.Claimable)
         nonReentrant
         returns (uint256 tokenAmount, uint256 refundAmount)
     {
-        if (!_isClaimable(presaleId)) revert PresaleNotClaimable();
-
         Presale storage presale = presaleState[presaleId];
 
         // Claim tokens if available and not already claimed
@@ -435,21 +400,21 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         }
 
         // Revert if nothing to claim
-        if (tokenAmount == 0 && refundAmount == 0) revert NoTokensToClaim();
+        if (tokenAmount == 0 && refundAmount == 0) revert NothingToClaim();
     }
 
     function claimUsdc(uint256 presaleId, address recipient)
         external
         presaleExists(presaleId)
+        onlyStatus(presaleId, PresaleStatus.Claimable)
     {
         Presale storage presale = presaleState[presaleId];
 
         if (msg.sender != presale.presaleOwner && msg.sender != owner()) revert Unauthorized();
         if (msg.sender == owner() && recipient != presale.presaleOwner) {
-            revert RecipientMustBePresaleOwner();
+            revert InvalidRecipient();
         }
-        if (!_isClaimable(presaleId)) revert PresaleNotClaimable();
-        if (presale.usdcClaimed) revert PresaleAlreadyClaimed();
+        if (presale.usdcClaimed) revert AlreadyClaimed();
 
         presale.usdcClaimed = true;
 
@@ -480,20 +445,21 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
             deploymentConfig.extensionConfigs[extensionIndex].extensionData,
             (uint256)
         );
-        Presale storage presale = presaleState[presaleId];
+
+        _requireStatus(presaleId, PresaleStatus.ReadyForDeployment);
 
         if (deploymentConfig.extensionConfigs[extensionIndex].msgValue != 0 || msg.value != 0) {
             revert InvalidMsgValue();
         }
 
-        if (!readyForDeployment[presaleId] || presale.deployedToken != address(0)) {
-            revert NotExpectingTokenDeployment();
-        }
+        Presale storage presale = presaleState[presaleId];
 
         IERC20(token).safeTransferFrom(msg.sender, address(this), extensionSupply);
 
         presale.deployedToken = token;
         presale.tokenSupply = extensionSupply;
+
+        emit TokensReceived(presaleId, token, extensionSupply);
     }
 
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
@@ -508,16 +474,12 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         return presale;
     }
 
+    function getPresaleStatus(uint256 presaleId) external view returns (PresaleStatus) {
+        return _getStatus(presaleId);
+    }
+
     function getContribution(uint256 presaleId, address user) external view returns (uint256) {
         return contributions[presaleId][user];
-    }
-
-    function getUserScore(uint256, address) external pure returns (uint256) {
-        return 0;
-    }
-
-    function getMaxContribution(uint256, address) external pure returns (uint256) {
-        return type(uint256).max;
     }
 
     function getAcceptedContribution(uint256 presaleId, address user)
@@ -557,19 +519,12 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         return maxAcceptedUsdc[presaleId][user];
     }
 
-    function getPresaleStatus(uint256 presaleId) external view returns (PresaleStatus) {
-        return _getStatus(presaleId);
-    }
-
-    function isPresaleActive(uint256 presaleId) external view returns (bool) {
-        return _isActive(presaleId);
-    }
-
-    function isPresaleFailed(uint256 presaleId) external view returns (bool) {
-        return _isFailed(presaleId);
-    }
-
-    function isPresaleClaimable(uint256 presaleId) external view returns (bool) {
-        return _isClaimable(presaleId);
+    function getTotalAcceptedUsdc(uint256 presaleId)
+        external
+        view
+        presaleExists(presaleId)
+        returns (uint256)
+    {
+        return totalAcceptedUsdc[presaleId];
     }
 }

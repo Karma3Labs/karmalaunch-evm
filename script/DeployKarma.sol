@@ -8,7 +8,7 @@ import {Karma} from "../contracts/Karma.sol";
 import {KarmaFeeLocker} from "../contracts/KarmaFeeLocker.sol";
 
 // Extensions
-import {KarmaReputationPresale} from "../contracts/extensions/KarmaReputationPresale.sol";
+import {KarmaAllocatedPresale} from "../contracts/extensions/KarmaAllocatedPresale.sol";
 
 /// @title DeployKarma
 /// @notice Main deployment script for Karma Token Launcher and all supporting contracts
@@ -83,17 +83,15 @@ contract DeployKarma is BaseScript {
     function deployExtensions() internal {
         console.log("--- Deploying Extensions ---");
 
-        // Deploy KarmaReputationPresale
-        // Note: reputationManager can be set to address(0) initially and configured later via setReputationManager()
-        KarmaReputationPresale reputationPresale = new KarmaReputationPresale(
+        // Deploy KarmaAllocatedPresale
+        KarmaAllocatedPresale allocatedPresale = new KarmaAllocatedPresale(
             deployer,
             deployed.karma,
             USDC,
-            teamFeeRecipient,
-            address(0) // reputationManager - set later via setReputationManager()
+            teamFeeRecipient
         );
-        deployed.karmaReputationPresale = address(reputationPresale);
-        logDeployment("KarmaReputationPresale", deployed.karmaReputationPresale);
+        deployed.karmaAllocatedPresale = address(allocatedPresale);
+        logDeployment("KarmaAllocatedPresale", deployed.karmaAllocatedPresale);
 
         console.log("");
     }
@@ -107,7 +105,7 @@ contract DeployKarma is BaseScript {
 
         // Enable Extensions
         console.log("Enabling extensions...");
-        karma.setExtension(deployed.karmaReputationPresale, true);
+        karma.setExtension(deployed.karmaAllocatedPresale, true);
 
         console.log("Karma configuration complete!");
         console.log("");
@@ -126,7 +124,7 @@ contract DeployKarma is BaseScript {
         console.log("");
 
         console.log("Extensions:");
-        console.log("  KarmaReputationPresale:", deployed.karmaReputationPresale);
+        console.log("  KarmaAllocatedPresale:", deployed.karmaAllocatedPresale);
         console.log("");
 
         console.log("=== Deployment Complete ===");

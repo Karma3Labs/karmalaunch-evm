@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
-import {KarmaReputationPresaleV2} from "../contracts/extensions/KarmaReputationPresaleV2.sol";
+import {KarmaAllocatedPresale} from "../contracts/extensions/KarmaAllocatedPresale.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
 contract MockUSDC is ERC20 {
@@ -47,15 +47,15 @@ contract DeployTestContracts is Script {
         MockToken token = new MockToken();
         console.log("MockToken deployed at:", address(token));
 
-        // Deploy KarmaReputationPresaleV2
+        // Deploy KarmaAllocatedPresale
         // Note: Using deployer as mock factory since we're testing
-        KarmaReputationPresaleV2 presale = new KarmaReputationPresaleV2(
+        KarmaAllocatedPresale presale = new KarmaAllocatedPresale(
             deployer,           // owner
             deployer,           // factory (using deployer as mock factory for testing)
             address(usdc),      // usdc
             feeRecipient        // karma fee recipient
         );
-        console.log("KarmaReputationPresaleV2 deployed at:", address(presale));
+        console.log("KarmaAllocatedPresale deployed at:", address(presale));
 
         // Set admin
         presale.setAdmin(admin, true);

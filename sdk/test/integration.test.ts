@@ -15,7 +15,7 @@ import { foundry } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
 
 import { KarmaPresaleSDK, PresaleStatus } from "../src/index.js";
-import { KarmaReputationPresaleV2Abi } from "../src/abis/KarmaReputationPresaleV2.js";
+import { KarmaAllocatedPresaleAbi } from "../src/abis/KarmaAllocatedPresale.js";
 import { ERC20Abi } from "../src/abis/ERC20.js";
 
 // Test constants
@@ -231,16 +231,9 @@ async function createPresale(): Promise<bigint> {
 
   const hash = await adminWallet.writeContract({
     address: presaleAddress,
-    abi: KarmaReputationPresaleV2Abi,
+    abi: KarmaAllocatedPresaleAbi,
     functionName: "createPresale",
-    args: [
-      deployer,
-      TARGET_USDC,
-      MIN_USDC,
-      PRESALE_DURATION,
-      PRESALE_TOKEN_SUPPLY,
-      deploymentConfig,
-    ],
+    args: [deployer, TARGET_USDC, MIN_USDC, PRESALE_DURATION, deploymentConfig],
   });
 
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
@@ -249,7 +242,7 @@ async function createPresale(): Promise<bigint> {
   const presaleCreatedLog = receipt.logs.find((log) => {
     try {
       const decoded = decodeEventLog({
-        abi: KarmaReputationPresaleV2Abi,
+        abi: KarmaAllocatedPresaleAbi,
         data: log.data,
         topics: log.topics,
       });
@@ -264,7 +257,7 @@ async function createPresale(): Promise<bigint> {
   }
 
   const decoded = decodeEventLog({
-    abi: KarmaReputationPresaleV2Abi,
+    abi: KarmaAllocatedPresaleAbi,
     data: presaleCreatedLog.data,
     topics: presaleCreatedLog.topics,
   });
@@ -280,7 +273,7 @@ async function setMaxAcceptedUsdcForUsers(
   for (const { user, maxUsdc } of allocations) {
     const hash = await adminWallet.writeContract({
       address: presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
+      abi: KarmaAllocatedPresaleAbi,
       functionName: "setMaxAcceptedUsdc",
       args: [presaleId, user, maxUsdc],
     });
@@ -293,7 +286,7 @@ async function completeDeployment(presaleId: bigint): Promise<void> {
   // First prepare for deployment
   const prepareHash = await deployerWallet.writeContract({
     address: presaleAddress,
-    abi: KarmaReputationPresaleV2Abi,
+    abi: KarmaAllocatedPresaleAbi,
     functionName: "prepareForDeployment",
     args: [
       presaleId,
@@ -376,7 +369,7 @@ async function completeDeployment(presaleId: bigint): Promise<void> {
   // Call receiveTokens as the factory (deployer)
   const receiveHash = await deployerWallet.writeContract({
     address: presaleAddress,
-    abi: KarmaReputationPresaleV2Abi,
+    abi: KarmaAllocatedPresaleAbi,
     functionName: "receiveTokens",
     args: [deploymentConfig, poolKey, tokenAddress, PRESALE_TOKEN_SUPPLY, 0n],
   });
