@@ -4,7 +4,6 @@ pragma solidity ^0.8.28;
 import {IKarma} from "../interfaces/IKarma.sol";
 import {IKarmaExtension} from "../interfaces/IKarmaExtension.sol";
 import {IKarmaReputationPresale} from "./interfaces/IKarmaReputationPresale.sol";
-import {IReputationManager} from "../interfaces/IReputationManager.sol";
 
 import {OwnerAdmins} from "../utils/OwnerAdmins.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -14,23 +13,21 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 
 /**
  * @title KarmaReputationPresaleV2
- * @notice A presale extension with priority-based allocation (highest reputation first).
+ * @notice A presale extension where maxAcceptedUsdc is set per user by admin.
  *
- * Behavior:
- *   - Under minUsdc raised: Presale fails, users can claim refunds
- *   - Under targetUsdc raised: No caps applied, all contributions accepted
- *   - Above targetUsdc raised: Priority allocation from highest to lowest reputation
+ * Key design:
+ *   - Admin sets maxAcceptedUsdc per user (not token amounts)
+ *   - Token supply is NOT known upfront - determined when factory sends tokens
+ *   - User's token allocation = (acceptedUsdc / totalAcceptedUsdc) * tokenSupply
+ *   - User's refund = contribution - min(contribution, maxAcceptedUsdc)
  *
- * Priority Allocation (when oversubscribed):
- *   1. Sort contributors by reputation score (highest first)
- *   2. Accept full contribution from each user in order
- *   3. When cumulative accepted reaches targetUsdc, stop
- *   4. The boundary user may get partial acceptance
- *   5. All remaining users get full refunds
- *
- * Sorting Notes:
- *   - Users with same reputation: order is random (based on contribution order)
- *   - Users with no reputation (score = 0): handled last, after all users with reputation
+ * State is determined by timestamps and on-chain data:
+ *   - Active: block.timestamp < endTime
+ *   - Failed: block.timestamp >= endTime && totalContributions < minUsdc
+ *   - PendingAllocation: presale ended, minimum met, waiting for allocation uploads
+ *   - AllocationUploaded: some allocations set
+ *   - ReadyForDeployment: salt has been set, waiting for factory
+ *   - Claimable: deployedToken != address(0)
  */
 contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, OwnerAdmins {
     using SafeERC20 for IERC20;
@@ -49,9 +46,6 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
 
     // ============ State ============
 
-    IReputationManager public reputationManager;
-
-    uint256 public minScoreUploadBuffer;
     uint256 public karmaDefaultFeeBps;
     address public karmaFeeRecipient;
 
@@ -61,14 +55,19 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
     mapping(uint256 => mapping(address => uint256)) public contributions;
     mapping(uint256 => mapping(address => bool)) public tokensClaimed;
     mapping(uint256 => mapping(address => bool)) public refundClaimed;
-    mapping(uint256 => bytes32) public presaleContext;
 
-    // V2 specific: track contributors for priority sorting
-    mapping(uint256 => address[]) public contributors;
-    mapping(uint256 => mapping(address => bool)) public hasContributed;
+    // Per-user max accepted USDC (set by admin): presaleId -> user -> maxAmount
+    mapping(uint256 => mapping(address => uint256)) public maxAcceptedUsdc;
+    // Total accepted USDC across all users: presaleId -> totalAmount
     mapping(uint256 => uint256) public totalAcceptedUsdc;
-    mapping(uint256 => bool) public allocationCalculated;
-    mapping(uint256 => mapping(address => uint256)) public acceptedContributions;
+
+    // State tracking
+    mapping(uint256 => bool) public readyForDeployment;
+    mapping(uint256 => bool) public allocationComplete;
+
+    // ============ Events ============
+
+    event MaxAcceptedUsdcSet(uint256 indexed presaleId, address indexed user, uint256 maxUsdc, uint256 acceptedUsdc);
 
     // ============ Modifiers ============
 
@@ -82,62 +81,105 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         _;
     }
 
-    modifier updatePresaleStatus(uint256 presaleId) {
-        Presale storage presale = presaleState[presaleId];
-
-        if (presale.status == PresaleStatus.Active && block.timestamp >= presale.endTime) {
-            if (presale.totalContributions >= presale.minUsdc) {
-                presale.status = PresaleStatus.PendingScores;
-            } else {
-                presale.status = PresaleStatus.Failed;
-                emit PresaleFailed(presaleId);
-            }
-        }
-
-        if (presale.status == PresaleStatus.PendingScores) {
-            bytes32 context = presaleContext[presaleId];
-            if (address(reputationManager) != address(0) && reputationManager.isFinalized(context)) {
-                presale.totalScore = reputationManager.getTotalScore(context);
-                presale.status = PresaleStatus.ScoresUploaded;
-                emit ScoresUploaded(presaleId, presale.totalScore);
-            } else if (block.timestamp > presale.scoreUploadDeadline) {
-                presale.status = PresaleStatus.Failed;
-                emit PresaleFailed(presaleId);
-            }
-        }
-        _;
-    }
-
     // ============ Constructor ============
 
     constructor(
         address owner_,
         address factory_,
         address usdc_,
-        address karmaFeeRecipient_,
-        address reputationManager_
+        address karmaFeeRecipient_
     ) OwnerAdmins(owner_) {
         factory = IKarma(factory_);
         usdc = IERC20(usdc_);
         karmaFeeRecipient = karmaFeeRecipient_;
-        reputationManager = IReputationManager(reputationManager_);
         _nextPresaleId = 1;
-        minScoreUploadBuffer = 1 days;
         karmaDefaultFeeBps = 500;
     }
 
+    // ============ Internal State Helpers ============
+
+    function _getStatus(uint256 presaleId) internal view returns (PresaleStatus) {
+        Presale storage presale = presaleState[presaleId];
+
+        if (presale.targetUsdc == 0) {
+            return PresaleStatus.NotCreated;
+        }
+
+        // If token is deployed, presale is claimable
+        if (presale.deployedToken != address(0)) {
+            return PresaleStatus.Claimable;
+        }
+
+        // If ready for deployment flag is set
+        if (readyForDeployment[presaleId]) {
+            return PresaleStatus.ReadyForDeployment;
+        }
+
+        // If still in contribution window
+        if (block.timestamp < presale.endTime) {
+            return PresaleStatus.Active;
+        }
+
+        // Contribution window has ended
+        // Check if minimum was met
+        if (presale.totalContributions < presale.minUsdc) {
+            return PresaleStatus.Failed;
+        }
+
+        // Minimum was met, check allocation progress
+        if (totalAcceptedUsdc[presaleId] == 0) {
+            return PresaleStatus.PendingScores;
+        }
+
+        // Some allocations have been set
+        return PresaleStatus.ScoresUploaded;
+    }
+
+    function _isActive(uint256 presaleId) internal view returns (bool) {
+        return _getStatus(presaleId) == PresaleStatus.Active;
+    }
+
+    function _isFailed(uint256 presaleId) internal view returns (bool) {
+        Presale storage presale = presaleState[presaleId];
+
+        if (presale.deployedToken != address(0)) return false;
+        if (block.timestamp < presale.endTime) return false;
+        if (presale.totalContributions >= presale.minUsdc) return false;
+
+        return true;
+    }
+
+    function _canSetAllocations(uint256 presaleId) internal view returns (bool) {
+        PresaleStatus status = _getStatus(presaleId);
+        return status == PresaleStatus.PendingScores || status == PresaleStatus.ScoresUploaded;
+    }
+
+    function _isClaimable(uint256 presaleId) internal view returns (bool) {
+        return presaleState[presaleId].deployedToken != address(0);
+    }
+
+    function _getAcceptedUsdc(uint256 presaleId, address user) internal view returns (uint256) {
+        uint256 contributed = contributions[presaleId][user];
+        uint256 maxAccepted = maxAcceptedUsdc[presaleId][user];
+        return contributed < maxAccepted ? contributed : maxAccepted;
+    }
+
+    function _getTokenAllocation(uint256 presaleId, address user) internal view returns (uint256) {
+        Presale storage presale = presaleState[presaleId];
+        uint256 total = totalAcceptedUsdc[presaleId];
+        if (presale.tokenSupply == 0 || total == 0) return 0;
+
+        uint256 acceptedUsdc = _getAcceptedUsdc(presaleId, user);
+        return (acceptedUsdc * presale.tokenSupply) / total;
+    }
+
+    function _getRefundAmount(uint256 presaleId, address user) internal view returns (uint256) {
+        uint256 contributed = contributions[presaleId][user];
+        uint256 acceptedUsdc = _getAcceptedUsdc(presaleId, user);
+        return contributed > acceptedUsdc ? contributed - acceptedUsdc : 0;
+    }
+
     // ============ Admin Functions ============
-
-    function setReputationManager(address reputationManager_) external onlyOwner {
-        reputationManager = IReputationManager(reputationManager_);
-        emit ReputationManagerUpdated(reputationManager_);
-    }
-
-    function setMinScoreUploadBuffer(uint256 buffer) external onlyOwnerOrAdmin {
-        uint256 oldBuffer = minScoreUploadBuffer;
-        minScoreUploadBuffer = buffer;
-        emit ScoreUploadBufferUpdated(oldBuffer, buffer);
-    }
 
     function setKarmaDefaultFee(uint256 newFeeBps) external onlyOwnerOrAdmin {
         if (newFeeBps > BPS) revert InvalidKarmaFee();
@@ -158,9 +200,9 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         onlyOwnerOrAdmin
     {
         if (newFeeBps > BPS) revert InvalidKarmaFee();
-        Presale storage presale = presaleState[presaleId];
-        if (presale.status != PresaleStatus.Active) revert PresaleNotActive();
+        if (!_isActive(presaleId)) revert PresaleNotActive();
 
+        Presale storage presale = presaleState[presaleId];
         uint256 oldFee = presale.karmaFeeBps;
         presale.karmaFeeBps = newFeeBps;
         emit KarmaFeeUpdatedForPresale(presaleId, oldFee, newFeeBps);
@@ -173,15 +215,11 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         uint256 targetUsdc,
         uint256 minUsdc,
         uint256 duration,
-        uint256 scoreUploadBuffer,
-        bytes32 reputationContext,
         IKarma.DeploymentConfig memory deploymentConfig
     ) external onlyOwnerOrAdmin returns (uint256 presaleId) {
         if (presaleOwner == address(0)) revert InvalidPresaleOwner();
         if (targetUsdc == 0 || minUsdc == 0 || minUsdc > targetUsdc) revert InvalidUsdcGoal();
         if (duration == 0 || duration > MAX_PRESALE_DURATION) revert InvalidPresaleDuration();
-        if (scoreUploadBuffer < minScoreUploadBuffer) revert InvalidScoreUploadBuffer();
-        if (address(reputationManager) == address(0)) revert ReputationManagerNotSet();
 
         uint256 extensionCount = deploymentConfig.extensionConfigs.length;
         if (extensionCount == 0 || deploymentConfig.extensionConfigs[extensionCount - 1].extension != address(this)) {
@@ -202,16 +240,13 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
 
         Presale storage presale = presaleState[presaleId];
 
-        presale.status = PresaleStatus.Active;
         presale.presaleOwner = presaleOwner;
         presale.targetUsdc = targetUsdc;
         presale.minUsdc = minUsdc;
         presale.endTime = block.timestamp + duration;
-        presale.scoreUploadDeadline = presale.endTime + scoreUploadBuffer;
+        presale.scoreUploadDeadline = presale.endTime + DEPLOYMENT_BAD_BUFFER;
         presale.karmaFeeBps = karmaDefaultFeeBps;
         presale.deploymentConfig = deploymentConfig;
-
-        presaleContext[presaleId] = reputationContext;
 
         emit PresaleCreated(
             presaleId,
@@ -221,7 +256,7 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
             presale.endTime,
             presale.scoreUploadDeadline,
             presale.karmaFeeBps,
-            reputationContext
+            bytes32(presaleId)
         );
     }
 
@@ -230,20 +265,13 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
     function contribute(uint256 presaleId, uint256 amount)
         external
         presaleExists(presaleId)
-        updatePresaleStatus(presaleId)
         nonReentrant
     {
         Presale storage presale = presaleState[presaleId];
 
-        if (presale.status != PresaleStatus.Active) revert PresaleNotActive();
         if (block.timestamp >= presale.endTime) revert ContributionWindowEnded();
 
         usdc.safeTransferFrom(msg.sender, address(this), amount);
-
-        if (!hasContributed[presaleId][msg.sender]) {
-            hasContributed[presaleId][msg.sender] = true;
-            contributors[presaleId].push(msg.sender);
-        }
 
         contributions[presaleId][msg.sender] += amount;
         presale.totalContributions += amount;
@@ -254,14 +282,13 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
     function withdrawContribution(uint256 presaleId, uint256 amount)
         external
         presaleExists(presaleId)
-        updatePresaleStatus(presaleId)
         nonReentrant
     {
         Presale storage presale = presaleState[presaleId];
 
-        if (presale.status != PresaleStatus.Active && presale.status != PresaleStatus.Failed) {
-            revert PresaleSuccessful();
-        }
+        // Can withdraw if active or failed
+        bool canWithdraw = _isActive(presaleId) || _isFailed(presaleId);
+        if (!canWithdraw) revert PresaleSuccessful();
 
         if (contributions[presaleId][msg.sender] < amount) revert InsufficientBalance();
 
@@ -273,58 +300,74 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         emit ContributionWithdrawn(presaleId, msg.sender, amount, presale.totalContributions);
     }
 
-    // ============ Score & Allocation Functions ============
+    // ============ Allocation Setting ============
 
-    function checkScores(uint256 presaleId)
+    /// @notice Set the maximum accepted USDC for a user
+    /// @param presaleId The presale ID
+    /// @param user The user address
+    /// @param maxUsdc The maximum USDC that will be accepted from this user
+    function setMaxAcceptedUsdc(uint256 presaleId, address user, uint256 maxUsdc)
         external
         presaleExists(presaleId)
-        updatePresaleStatus(presaleId)
-    {}
-
-    function calculateAllocation(uint256 presaleId)
-        external
-        presaleExists(presaleId)
-        updatePresaleStatus(presaleId)
+        onlyOwnerOrAdmin
     {
-        Presale storage presale = presaleState[presaleId];
-
-        if (presale.status != PresaleStatus.ScoresUploaded) revert PresaleNotScoresUploaded();
-        if (allocationCalculated[presaleId]) return;
-
-        if (presale.totalContributions <= presale.targetUsdc) {
-            address[] storage contribs = contributors[presaleId];
-            for (uint256 i = 0; i < contribs.length; i++) {
-                address user = contribs[i];
-                acceptedContributions[presaleId][user] = contributions[presaleId][user];
-            }
-            totalAcceptedUsdc[presaleId] = presale.totalContributions;
-            allocationCalculated[presaleId] = true;
-            return;
+        if (!_canSetAllocations(presaleId)) {
+            revert PresaleNotScoresUploaded();
         }
 
-        address[] memory sorted = _getSortedContributors(presaleId);
+        // Remove previous accepted amount from total
+        uint256 previousAccepted = _getAcceptedUsdc(presaleId, user);
+        totalAcceptedUsdc[presaleId] -= previousAccepted;
 
-        uint256 cumulative = 0;
-        uint256 target = presale.targetUsdc;
+        // Set new max and calculate new accepted amount
+        maxAcceptedUsdc[presaleId][user] = maxUsdc;
+        uint256 newAccepted = _getAcceptedUsdc(presaleId, user);
+        totalAcceptedUsdc[presaleId] += newAccepted;
 
-        for (uint256 i = 0; i < sorted.length; i++) {
-            address user = sorted[i];
-            uint256 contributed = contributions[presaleId][user];
+        emit MaxAcceptedUsdcSet(presaleId, user, maxUsdc, newAccepted);
+    }
 
-            if (cumulative >= target) {
-                acceptedContributions[presaleId][user] = 0;
-            } else if (cumulative + contributed <= target) {
-                acceptedContributions[presaleId][user] = contributed;
-                cumulative += contributed;
-            } else {
-                uint256 accepted = target - cumulative;
-                acceptedContributions[presaleId][user] = accepted;
-                cumulative = target;
-            }
+    /// @notice Batch set maxAcceptedUsdc for multiple users
+    /// @param presaleId The presale ID
+    /// @param users Array of user addresses
+    /// @param maxUsdcAmounts Array of max USDC amounts
+    function batchSetMaxAcceptedUsdc(
+        uint256 presaleId,
+        address[] calldata users,
+        uint256[] calldata maxUsdcAmounts
+    ) external presaleExists(presaleId) onlyOwnerOrAdmin {
+        if (!_canSetAllocations(presaleId)) {
+            revert PresaleNotScoresUploaded();
         }
+        require(users.length == maxUsdcAmounts.length, "Length mismatch");
 
-        totalAcceptedUsdc[presaleId] = cumulative;
-        allocationCalculated[presaleId] = true;
+        for (uint256 i = 0; i < users.length; i++) {
+            address user = users[i];
+            uint256 maxUsdc = maxUsdcAmounts[i];
+
+            // Remove previous accepted amount from total
+            uint256 previousAccepted = _getAcceptedUsdc(presaleId, user);
+            totalAcceptedUsdc[presaleId] -= previousAccepted;
+
+            // Set new max and calculate new accepted amount
+            maxAcceptedUsdc[presaleId][user] = maxUsdc;
+            uint256 newAccepted = _getAcceptedUsdc(presaleId, user);
+            totalAcceptedUsdc[presaleId] += newAccepted;
+
+            emit MaxAcceptedUsdcSet(presaleId, user, maxUsdc, newAccepted);
+        }
+    }
+
+    /// @notice Mark allocation as complete - no more changes allowed
+    function finalizeAllocation(uint256 presaleId)
+        external
+        presaleExists(presaleId)
+        onlyOwnerOrAdmin
+    {
+        if (_getStatus(presaleId) != PresaleStatus.ScoresUploaded) {
+            revert PresaleNotScoresUploaded();
+        }
+        allocationComplete[presaleId] = true;
     }
 
     // ============ Deployment ============
@@ -332,19 +375,16 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
     function prepareForDeployment(uint256 presaleId, bytes32 salt)
         external
         presaleExists(presaleId)
-        updatePresaleStatus(presaleId)
     {
         Presale storage presale = presaleState[presaleId];
 
-        if (presale.status != PresaleStatus.ScoresUploaded) revert PresaleNotScoresUploaded();
+        // Must have allocations set
+        if (_getStatus(presaleId) != PresaleStatus.ScoresUploaded) revert PresaleNotScoresUploaded();
 
-        if (!allocationCalculated[presaleId]) {
-            this.calculateAllocation(presaleId);
-        }
+        // Must have some accepted USDC
+        if (totalAcceptedUsdc[presaleId] == 0) revert PresaleNotScoresUploaded();
 
         if (block.timestamp > presale.scoreUploadDeadline + DEPLOYMENT_BAD_BUFFER) {
-            presale.status = PresaleStatus.Failed;
-            emit PresaleFailed(presaleId);
             revert DeploymentBufferExpired();
         }
 
@@ -353,51 +393,49 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         }
 
         presale.deploymentConfig.tokenConfig.salt = salt;
-        presale.status = PresaleStatus.ReadyForDeployment;
+        readyForDeployment[presaleId] = true;
 
         emit PresaleReadyForDeployment(presaleId);
     }
 
     // ============ Claim Functions ============
 
-    function claimTokens(uint256 presaleId)
+    /// @notice Claim both tokens and refund in a single transaction
+    /// @param presaleId The presale ID to claim from
+    /// @return tokenAmount The amount of tokens claimed
+    /// @return refundAmount The amount of USDC refunded
+    function claim(uint256 presaleId)
         external
         presaleExists(presaleId)
         nonReentrant
+        returns (uint256 tokenAmount, uint256 refundAmount)
     {
+        if (!_isClaimable(presaleId)) revert PresaleNotClaimable();
+
         Presale storage presale = presaleState[presaleId];
 
-        if (presale.status != PresaleStatus.Claimable) revert PresaleNotClaimable();
-        if (tokensClaimed[presaleId][msg.sender]) revert NoTokensToClaim();
+        // Claim tokens if available and not already claimed
+        if (!tokensClaimed[presaleId][msg.sender]) {
+            tokenAmount = _getTokenAllocation(presaleId, msg.sender);
+            if (tokenAmount > 0) {
+                tokensClaimed[presaleId][msg.sender] = true;
+                IERC20(presale.deployedToken).safeTransfer(msg.sender, tokenAmount);
+                emit TokensClaimed(presaleId, msg.sender, tokenAmount);
+            }
+        }
 
-        uint256 allocation = _calculateTokenAllocation(presaleId, msg.sender);
+        // Claim refund if available and not already claimed
+        if (!refundClaimed[presaleId][msg.sender]) {
+            refundAmount = _getRefundAmount(presaleId, msg.sender);
+            if (refundAmount > 0) {
+                refundClaimed[presaleId][msg.sender] = true;
+                usdc.safeTransfer(msg.sender, refundAmount);
+                emit RefundClaimed(presaleId, msg.sender, refundAmount);
+            }
+        }
 
-        if (allocation == 0) revert NoTokensToClaim();
-
-        tokensClaimed[presaleId][msg.sender] = true;
-
-        IERC20(presale.deployedToken).safeTransfer(msg.sender, allocation);
-
-        emit TokensClaimed(presaleId, msg.sender, allocation);
-    }
-
-    function claimRefund(uint256 presaleId)
-        external
-        presaleExists(presaleId)
-        nonReentrant
-    {
-        Presale storage presale = presaleState[presaleId];
-
-        if (presale.status != PresaleStatus.Claimable) revert PresaleNotClaimable();
-        if (refundClaimed[presaleId][msg.sender]) revert NoRefundAvailable();
-
-        uint256 refund = _calculateRefund(presaleId, msg.sender);
-        if (refund == 0) revert NoRefundAvailable();
-
-        refundClaimed[presaleId][msg.sender] = true;
-        usdc.safeTransfer(msg.sender, refund);
-
-        emit RefundClaimed(presaleId, msg.sender, refund);
+        // Revert if nothing to claim
+        if (tokenAmount == 0 && refundAmount == 0) revert NoTokensToClaim();
     }
 
     function claimUsdc(uint256 presaleId, address recipient)
@@ -410,7 +448,7 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         if (msg.sender == owner() && recipient != presale.presaleOwner) {
             revert RecipientMustBePresaleOwner();
         }
-        if (presale.status != PresaleStatus.Claimable) revert PresaleNotClaimable();
+        if (!_isClaimable(presaleId)) revert PresaleNotClaimable();
         if (presale.usdcClaimed) revert PresaleAlreadyClaimed();
 
         presale.usdcClaimed = true;
@@ -448,13 +486,14 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
             revert InvalidMsgValue();
         }
 
-        if (presale.status != PresaleStatus.ReadyForDeployment) revert NotExpectingTokenDeployment();
+        if (!readyForDeployment[presaleId] || presale.deployedToken != address(0)) {
+            revert NotExpectingTokenDeployment();
+        }
 
         IERC20(token).safeTransferFrom(msg.sender, address(this), extensionSupply);
 
         presale.deployedToken = token;
         presale.tokenSupply = extensionSupply;
-        presale.status = PresaleStatus.Claimable;
     }
 
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
@@ -464,40 +503,21 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
     // ============ View Functions ============
 
     function getPresale(uint256 presaleId) external view returns (Presale memory) {
-        return presaleState[presaleId];
+        Presale memory presale = presaleState[presaleId];
+        presale.status = _getStatus(presaleId);
+        return presale;
     }
 
     function getContribution(uint256 presaleId, address user) external view returns (uint256) {
         return contributions[presaleId][user];
     }
 
-    function getUserScore(uint256 presaleId, address user) external view returns (uint256) {
-        return _getUserScore(presaleId, user);
+    function getUserScore(uint256, address) external pure returns (uint256) {
+        return 0;
     }
 
-    function getPresaleContext(uint256 presaleId) external view returns (bytes32) {
-        return presaleContext[presaleId];
-    }
-
-    function getContributors(uint256 presaleId) external view returns (address[] memory) {
-        return contributors[presaleId];
-    }
-
-    function getContributorCount(uint256 presaleId) external view returns (uint256) {
-        return contributors[presaleId].length;
-    }
-
-    function getMaxContribution(uint256 presaleId, address user)
-        external
-        view
-        presaleExists(presaleId)
-        returns (uint256)
-    {
-        Presale storage presale = presaleState[presaleId];
-        if (presale.status == PresaleStatus.Active) {
-            return type(uint256).max;
-        }
-        return acceptedContributions[presaleId][user];
+    function getMaxContribution(uint256, address) external pure returns (uint256) {
+        return type(uint256).max;
     }
 
     function getAcceptedContribution(uint256 presaleId, address user)
@@ -506,14 +526,7 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         presaleExists(presaleId)
         returns (uint256)
     {
-        if (!allocationCalculated[presaleId]) {
-            Presale storage presale = presaleState[presaleId];
-            if (presale.totalContributions <= presale.targetUsdc) {
-                return contributions[presaleId][user];
-            }
-            return 0;
-        }
-        return acceptedContributions[presaleId][user];
+        return _getAcceptedUsdc(presaleId, user);
     }
 
     function getRefundAmount(uint256 presaleId, address user)
@@ -523,7 +536,7 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         returns (uint256)
     {
         if (refundClaimed[presaleId][user]) return 0;
-        return _calculateRefund(presaleId, user);
+        return _getRefundAmount(presaleId, user);
     }
 
     function getTokenAllocation(uint256 presaleId, address user)
@@ -532,63 +545,31 @@ contract KarmaReputationPresaleV2 is ReentrancyGuard, IKarmaReputationPresale, O
         presaleExists(presaleId)
         returns (uint256)
     {
-        return _calculateTokenAllocation(presaleId, user);
+        return _getTokenAllocation(presaleId, user);
     }
 
-    // ============ Internal Functions ============
-
-    function _getUserScore(uint256 presaleId, address user) internal view returns (uint256) {
-        if (address(reputationManager) == address(0)) return 0;
-        bytes32 context = presaleContext[presaleId];
-        return reputationManager.getScore(context, user);
+    function getMaxAcceptedUsdc(uint256 presaleId, address user)
+        external
+        view
+        presaleExists(presaleId)
+        returns (uint256)
+    {
+        return maxAcceptedUsdc[presaleId][user];
     }
 
-    function _getSortedContributors(uint256 presaleId) internal view returns (address[] memory) {
-        address[] memory contribs = contributors[presaleId];
-        uint256 len = contribs.length;
-
-        uint256[] memory scores = new uint256[](len);
-        for (uint256 i = 0; i < len; i++) {
-            scores[i] = _getUserScore(presaleId, contribs[i]);
-        }
-
-        for (uint256 i = 1; i < len; i++) {
-            address keyAddr = contribs[i];
-            uint256 keyScore = scores[i];
-            int256 j = int256(i) - 1;
-
-            while (j >= 0 && scores[uint256(j)] < keyScore) {
-                contribs[uint256(j) + 1] = contribs[uint256(j)];
-                scores[uint256(j) + 1] = scores[uint256(j)];
-                j--;
-            }
-            contribs[uint256(j + 1)] = keyAddr;
-            scores[uint256(j + 1)] = keyScore;
-        }
-
-        return contribs;
+    function getPresaleStatus(uint256 presaleId) external view returns (PresaleStatus) {
+        return _getStatus(presaleId);
     }
 
-    function _calculateRefund(uint256 presaleId, address user) internal view returns (uint256) {
-        if (!allocationCalculated[presaleId]) return 0;
-
-        uint256 contributed = contributions[presaleId][user];
-        uint256 accepted = acceptedContributions[presaleId][user];
-
-        return contributed > accepted ? contributed - accepted : 0;
+    function isPresaleActive(uint256 presaleId) external view returns (bool) {
+        return _isActive(presaleId);
     }
 
-    function _calculateTokenAllocation(uint256 presaleId, address user) internal view returns (uint256) {
-        Presale storage presale = presaleState[presaleId];
-        if (presale.tokenSupply == 0) return 0;
-        if (!allocationCalculated[presaleId]) return 0;
+    function isPresaleFailed(uint256 presaleId) external view returns (bool) {
+        return _isFailed(presaleId);
+    }
 
-        uint256 accepted = acceptedContributions[presaleId][user];
-        if (accepted == 0) return 0;
-
-        uint256 totalAccepted = totalAcceptedUsdc[presaleId];
-        if (totalAccepted == 0) return 0;
-
-        return (accepted * presale.tokenSupply) / totalAccepted;
+    function isPresaleClaimable(uint256 presaleId) external view returns (bool) {
+        return _isClaimable(presaleId);
     }
 }

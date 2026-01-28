@@ -16,14 +16,12 @@ contract DeployKarmaReputationPresaleV2 is BaseScript {
         address karmaAddress = vm.envAddress("KARMA_ADDRESS");
         address usdcAddress = vm.envOr("USDC_ADDRESS", USDC);
         address karmaFeeRecipient = vm.envOr("KARMA_FEE_RECIPIENT", deployer);
-        address reputationManagerAddress = vm.envOr("REPUTATION_MANAGER_ADDRESS", address(0));
         bool enableOnKarma = vm.envOr("ENABLE_ON_KARMA", true);
 
         console.log("=== Deploying KarmaReputationPresaleV2 Extension ===");
         console.log("Karma address:", karmaAddress);
         console.log("USDC address:", usdcAddress);
         console.log("Karma fee recipient:", karmaFeeRecipient);
-        console.log("Reputation manager:", reputationManagerAddress);
         console.log("Enable on Karma:", enableOnKarma);
 
         startBroadcast();
@@ -33,8 +31,7 @@ contract DeployKarmaReputationPresaleV2 is BaseScript {
             deployer,                   // owner
             karmaAddress,               // factory
             usdcAddress,                // usdc
-            karmaFeeRecipient,          // karma fee recipient
-            reputationManagerAddress    // reputation manager (can be address(0) and set later)
+            karmaFeeRecipient           // karma fee recipient
         );
         deployed.karmaReputationPresaleV2 = address(reputationPresaleV2);
         logDeployment("KarmaReputationPresaleV2", deployed.karmaReputationPresaleV2);
@@ -57,45 +54,39 @@ contract DeployKarmaReputationPresaleV2 is BaseScript {
         console.log("  Factory:", karmaAddress);
         console.log("  USDC:", usdcAddress);
         console.log("  Karma Fee Recipient:", karmaFeeRecipient);
-        console.log("  Reputation Manager:", reputationManagerAddress);
         console.log("");
         console.log("Default Parameters:");
-        console.log("  Min Lockup Duration: 7 days");
-        console.log("  Min Score Upload Buffer: 1 day");
         console.log("  Karma Default Fee BPS: 500 (5%)");
         console.log("  Max Presale Duration: 6 weeks");
         console.log("  Salt Set Buffer: 1 day");
         console.log("  Deployment Bad Buffer: 3 days");
         console.log("");
-        console.log("V2 Priority Allocation:");
-        console.log("  - Users sorted by reputation (highest first)");
-        console.log("  - Full contributions accepted until target reached");
-        console.log("  - Boundary user may get partial acceptance");
-        console.log("  - Users with same score: random order");
-        console.log("  - Users with no reputation: handled last");
+        console.log("V2 Uploaded Allocations:");
+        console.log("  - Token supply predetermined at presale creation");
+        console.log("  - Owner uploads individual token allocations off-chain");
+        console.log("  - Allocations must sum to expected token supply");
+        console.log("  - Token supply verified when received from factory");
         console.log("");
         console.log("Features:");
-        console.log("  - Priority-based presale mechanism");
+        console.log("  - Off-chain allocation calculation");
         console.log("  - USDC contributions");
-        console.log("  - Highest reputation users get full allocation");
-        console.log("  - Everyone pays the same price per token");
-        console.log("  - Lockup and vesting periods for tokens");
+        console.log("  - Owner uploads allocations (no on-chain loops)");
+        console.log("  - Predetermined token supply");
         console.log("");
         console.log("Admin Functions:");
-        console.log("  - createPresale(): Create a new reputation presale");
-        console.log("  - setMinLockupDuration(): Update minimum lockup duration");
-        console.log("  - setMinScoreUploadBuffer(): Update score upload buffer");
+        console.log("  - createPresale(): Create a new presale with predetermined token supply");
+        console.log("  - uploadAllocation(): Upload token allocation for a user");
         console.log("  - setKarmaDefaultFee(): Update default fee");
         console.log("  - setKarmaFeeRecipient(): Update fee recipient");
         console.log("  - setKarmaFeeForPresale(): Configure fee for specific presale");
         console.log("");
         console.log("Presale Lifecycle:");
-        console.log("  1. Admin creates presale with createPresale()");
+        console.log("  1. Admin creates presale with createPresale() specifying token supply");
         console.log("  2. Users contribute USDC with contribute()");
-        console.log("  3. After contribution window ends, scores are uploaded to ReputationManager");
-        console.log("  4. Anyone calls calculateAllocation() to compute priority-based allocation");
-        console.log("  5. Presale owner deploys token with deployToken()");
-        console.log("  6. Users claim tokens with claimTokens() (respecting lockup/vesting)");
+        console.log("  3. After contribution window ends, admin uploads allocations");
+        console.log("  4. Presale owner calls prepareForDeployment()");
+        console.log("  5. Factory deploys token and calls receiveTokens()");
+        console.log("  6. Users claim tokens with claimTokens()");
         console.log("  7. Users who didn't get allocation can claimRefund()");
         console.log("");
         console.log("User Functions:");
@@ -107,11 +98,9 @@ contract DeployKarmaReputationPresaleV2 is BaseScript {
         console.log("View Functions:");
         console.log("  - getPresale(): Get presale details");
         console.log("  - getContribution(): Get user's contribution amount");
-        console.log("  - getContributors(): Get list of all contributors");
-        console.log("  - getContributorCount(): Get number of contributors");
-        console.log("  - getAcceptedContribution(): Get accepted contribution after allocation");
+        console.log("  - getTokenAllocation(): Get user's token allocation");
         console.log("  - getRefundAmount(): Calculate refund amount");
-        console.log("  - getTokenAllocation(): Calculate token allocation");
-        console.log("  - amountAvailableToClaim(): Calculate claimable tokens");
+        console.log("  - getExpectedTokenSupply(): Get predetermined token supply");
+        console.log("  - getTotalAllocatedTokens(): Get sum of all uploaded allocations");
     }
 }

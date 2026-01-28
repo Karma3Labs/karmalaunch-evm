@@ -141,23 +141,16 @@ export class KarmaPresaleSDK {
   }
 
   async getPresaleInfo(presaleId: bigint): Promise<PresaleInfo> {
-    const [
-      presale,
-      expectedTokenSupply,
-      totalAllocatedTokens,
-      totalAcceptedUsdc,
-    ] = await Promise.all([
+    const [presale, totalAcceptedUsdc] = await Promise.all([
       this.getPresale(presaleId),
-      this.getExpectedTokenSupply(presaleId),
-      this.getTotalAllocatedTokens(presaleId),
       this.getTotalAcceptedUsdc(presaleId),
     ]);
 
     return {
       presaleId,
       presale,
-      expectedTokenSupply,
-      totalAllocatedTokens,
+      expectedTokenSupply: presale.tokenSupply, // Only known after deployment
+      totalAllocatedTokens: 0n, // No longer tracked separately
       totalAcceptedUsdc,
     };
   }
@@ -233,22 +226,19 @@ export class KarmaPresaleSDK {
     });
   }
 
+  /**
+   * @deprecated Token supply is only known after deployment
+   */
   async getExpectedTokenSupply(presaleId: bigint): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
-      functionName: "getExpectedTokenSupply",
-      args: [presaleId],
-    });
+    const presale = await this.getPresale(presaleId);
+    return presale.tokenSupply;
   }
 
-  async getTotalAllocatedTokens(presaleId: bigint): Promise<bigint> {
-    return this.publicClient.readContract({
-      address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
-      functionName: "getTotalAllocatedTokens",
-      args: [presaleId],
-    });
+  /**
+   * @deprecated No longer tracked - use totalAcceptedUsdc instead
+   */
+  async getTotalAllocatedTokens(_presaleId: bigint): Promise<bigint> {
+    return 0n;
   }
 
   async getTotalAcceptedUsdc(presaleId: bigint): Promise<bigint> {
@@ -395,7 +385,12 @@ export class KarmaPresaleSDK {
     return this.createTransactionResult(hash);
   }
 
-  async claimTokens(params: ClaimParams): Promise<TransactionResult> {
+  /**
+   * Claim tokens and refund in a single transaction
+   * @param params - The claim parameters containing presaleId
+   * @returns Transaction result
+   */
+  async claim(params: ClaimParams): Promise<TransactionResult> {
     const walletClient = this.getWalletClient();
     const account = await this.getAccount();
 
@@ -405,22 +400,29 @@ export class KarmaPresaleSDK {
       throw new PresaleNotClaimableError(params.presaleId, presale.status);
     }
 
-    // Check user has tokens to claim
+    // Check user has something to claim
     const allocation = await this.getTokenAllocation(params.presaleId, account);
-    if (allocation === 0n) {
-      throw new PresaleSDKError("No tokens to claim", "NO_TOKENS");
-    }
+    const refundAmount = await this.getRefundAmount(params.presaleId, account);
+    const tokensClaimed = await this.hasClaimedTokens(
+      params.presaleId,
+      account,
+    );
+    const refundClaimed = await this.hasClaimedRefund(
+      params.presaleId,
+      account,
+    );
 
-    // Check if already claimed
-    const claimed = await this.hasClaimedTokens(params.presaleId, account);
-    if (claimed) {
-      throw new PresaleSDKError("Tokens already claimed", "ALREADY_CLAIMED");
+    const hasUnclaimedTokens = allocation > 0n && !tokensClaimed;
+    const hasUnclaimedRefund = refundAmount > 0n && !refundClaimed;
+
+    if (!hasUnclaimedTokens && !hasUnclaimedRefund) {
+      throw new PresaleSDKError("Nothing to claim", "NOTHING_TO_CLAIM");
     }
 
     const hash = await walletClient.writeContract({
       address: this.presaleAddress,
       abi: KarmaReputationPresaleV2Abi,
-      functionName: "claimTokens",
+      functionName: "claim",
       args: [params.presaleId],
       account,
       chain: walletClient.chain,
@@ -429,41 +431,18 @@ export class KarmaPresaleSDK {
     return this.createTransactionResult(hash);
   }
 
+  /**
+   * @deprecated Use claim() instead which handles both tokens and refunds
+   */
+  async claimTokens(params: ClaimParams): Promise<TransactionResult> {
+    return this.claim(params);
+  }
+
+  /**
+   * @deprecated Use claim() instead which handles both tokens and refunds
+   */
   async claimRefund(params: ClaimParams): Promise<TransactionResult> {
-    const walletClient = this.getWalletClient();
-    const account = await this.getAccount();
-
-    // Validate presale is claimable
-    const presale = await this.getPresale(params.presaleId);
-    if (
-      presale.status !== PresaleStatus.Claimable &&
-      presale.status !== PresaleStatus.Failed
-    ) {
-      throw new PresaleNotClaimableError(params.presaleId, presale.status);
-    }
-
-    // Check user has refund available
-    const refundAmount = await this.getRefundAmount(params.presaleId, account);
-    if (refundAmount === 0n) {
-      throw new PresaleSDKError("No refund available", "NO_REFUND");
-    }
-
-    // Check if already claimed
-    const claimed = await this.hasClaimedRefund(params.presaleId, account);
-    if (claimed) {
-      throw new PresaleSDKError("Refund already claimed", "ALREADY_CLAIMED");
-    }
-
-    const hash = await walletClient.writeContract({
-      address: this.presaleAddress,
-      abi: KarmaReputationPresaleV2Abi,
-      functionName: "claimRefund",
-      args: [params.presaleId],
-      account,
-      chain: walletClient.chain,
-    });
-
-    return this.createTransactionResult(hash);
+    return this.claim(params);
   }
 
   // ============ Utility Functions ============

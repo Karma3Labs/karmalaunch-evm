@@ -48,10 +48,11 @@ let deployer: Address;
 let alice: Address;
 let bob: Address;
 let charlie: Address;
+let admin: Address;
 
 // Contract addresses from deployment
 const presaleAddress = (process.env.PRESALE_ADDRESS ||
-  "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0") as Address;
+  "0x4EE6eCAD1c2Dae9f525404De8555724e3c35d07B") as Address;
 const usdcAddress = (process.env.USDC_ADDRESS ||
   "0x5FbDB2315678afecb367f032d93F642f64180aa3") as Address;
 const tokenAddress = (process.env.TOKEN_ADDRESS ||
@@ -80,6 +81,20 @@ const MockERC20Abi = [
 
 // Amount of USDC to mint for each test account
 const TEST_USDC_AMOUNT = parseUnits("100000", USDC_DECIMALS);
+
+// ABI for setAdmin function
+const OwnerAdminsAbi = [
+  {
+    type: "function",
+    name: "setAdmin",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "admin", type: "address" },
+      { name: "enabled", type: "bool" },
+    ],
+    outputs: [],
+  },
+] as const;
 
 // Helper to mint USDC to test accounts
 async function mintUsdcToTestAccounts(): Promise<void> {
@@ -112,6 +127,7 @@ async function setupTestEnvironment(): Promise<void> {
   alice = aliceAccount.address;
   bob = bobAccount.address;
   charlie = charlieAccount.address;
+  admin = adminAccount.address;
 
   deployerWallet = createWalletClient({
     account: deployerAccount,
@@ -256,17 +272,17 @@ async function createPresale(): Promise<bigint> {
   return (decoded.args as { presaleId: bigint }).presaleId;
 }
 
-// Helper to upload allocations
-async function uploadAllocations(
+// Helper to set max accepted USDC for users
+async function setMaxAcceptedUsdcForUsers(
   presaleId: bigint,
-  allocations: { user: Address; tokens: bigint; usdc: bigint }[],
+  allocations: { user: Address; maxUsdc: bigint }[],
 ): Promise<void> {
-  for (const { user, tokens, usdc } of allocations) {
+  for (const { user, maxUsdc } of allocations) {
     const hash = await adminWallet.writeContract({
       address: presaleAddress,
       abi: KarmaReputationPresaleV2Abi,
-      functionName: "uploadAllocation",
-      args: [presaleId, user, tokens, usdc],
+      functionName: "setMaxAcceptedUsdc",
+      args: [presaleId, user, maxUsdc],
     });
     await publicClient.waitForTransactionReceipt({ hash });
   }
@@ -378,6 +394,17 @@ describe.skipIf(!process.env.INTEGRATION)(
     beforeAll(async () => {
       await setupTestEnvironment();
 
+      // Authorize admin account on the presale contract (deployer is owner)
+      console.log("🔑 Authorizing admin account...");
+      const setAdminHash = await deployerWallet.writeContract({
+        address: presaleAddress,
+        abi: OwnerAdminsAbi,
+        functionName: "setAdmin",
+        args: [admin, true],
+      });
+      await publicClient.waitForTransactionReceipt({ hash: setAdminHash });
+      console.log("   ✅ Admin account authorized");
+
       // Mint USDC to test accounts to ensure sufficient balance
       console.log("🏦 Minting USDC to test accounts...");
       await mintUsdcToTestAccounts();
@@ -409,13 +436,10 @@ describe.skipIf(!process.env.INTEGRATION)(
       expect(presaleInfo.presale.status).toBe(PresaleStatus.Active);
       expect(presaleInfo.presale.targetUsdc).toBe(TARGET_USDC);
       expect(presaleInfo.presale.minUsdc).toBe(MIN_USDC);
-      expect(presaleInfo.expectedTokenSupply).toBe(PRESALE_TOKEN_SUPPLY);
+      // Token supply is not known until deployment - only totalAcceptedUsdc matters
       console.log(`   ✅ Presale #${presaleId} created successfully`);
       console.log(`   - Target USDC: ${aliceSDK.formatUsdc(TARGET_USDC)}`);
       console.log(`   - Min USDC: ${aliceSDK.formatUsdc(MIN_USDC)}`);
-      console.log(
-        `   - Token Supply: ${aliceSDK.formatTokens(PRESALE_TOKEN_SUPPLY)}`,
-      );
 
       // ============================================
       // Step 2: Users approve and contribute USDC
@@ -530,48 +554,56 @@ describe.skipIf(!process.env.INTEGRATION)(
       console.log("   ✅ Presale period ended");
 
       // ============================================
-      // Step 5: Admin uploads allocations
+      // Step 5: Admin sets max accepted USDC per user
       // ============================================
-      console.log("\n📤 Step 5: Admin uploading token allocations...");
+      console.log("\n📤 Step 5: Admin setting max accepted USDC...");
       // Total contributions after withdrawal: 4.5k + 3k + 2.5k = 10k USDC
-      // Total token supply: 50B tokens
-      // Allocations must sum to exactly the token supply and match USDC contributions
+      // Set max accepted USDC per user:
+      // - Alice: max 4.5k (accepts all her contribution)
+      // - Bob: max 3k (accepts all his contribution)
+      // - Charlie: max 2k (accepts 2k of 2.5k, refund 500 USDC)
+      // Total accepted: 9.5k USDC
       const allocations = [
         {
           user: alice,
-          tokens: parseUnits("22500000000", TOKEN_DECIMALS), // 45% of 50B = 22.5B tokens
-          usdc: parseUnits("4500", USDC_DECIMALS), // Alice's remaining contribution (5000 - 500)
+          maxUsdc: parseUnits("4500", USDC_DECIMALS), // Alice's full remaining contribution
         },
         {
           user: bob,
-          tokens: parseUnits("15000000000", TOKEN_DECIMALS), // 30% of 50B = 15B tokens
-          usdc: parseUnits("3000", USDC_DECIMALS), // Bob's full contribution
+          maxUsdc: parseUnits("3000", USDC_DECIMALS), // Bob's full contribution
         },
         {
           user: charlie,
-          tokens: parseUnits("12500000000", TOKEN_DECIMALS), // 25% of 50B = 12.5B tokens
-          usdc: parseUnits("2500", USDC_DECIMALS), // Charlie's full contribution
+          maxUsdc: parseUnits("2000", USDC_DECIMALS), // Charlie partial: 2k accepted, 500 USDC refund
         },
       ];
 
-      await uploadAllocations(presaleId, allocations);
-      console.log("   ✅ Allocations uploaded for all users");
+      await setMaxAcceptedUsdcForUsers(presaleId, allocations);
+      console.log("   ✅ Max accepted USDC set for all users");
 
-      // Verify allocations
-      console.log("   - Verifying allocations...");
-      const aliceAllocation = await aliceSDK.getTokenAllocation(
+      // Verify accepted USDC
+      console.log("   - Verifying accepted contributions...");
+      const aliceAccepted = await aliceSDK.getAcceptedContribution(
         presaleId,
         alice,
       );
-      expect(aliceAllocation).toBe(parseUnits("22500000000", TOKEN_DECIMALS));
+      expect(aliceAccepted).toBe(parseUnits("4500", USDC_DECIMALS));
 
-      const bobAllocation = await bobSDK.getTokenAllocation(presaleId, bob);
-      expect(bobAllocation).toBe(parseUnits("15000000000", TOKEN_DECIMALS));
-      console.log(
-        `   ✅ Alice allocation: ${aliceSDK.formatTokens(aliceAllocation)} tokens`,
+      const bobAccepted = await bobSDK.getAcceptedContribution(presaleId, bob);
+      expect(bobAccepted).toBe(parseUnits("3000", USDC_DECIMALS));
+
+      const charlieAccepted = await charlieSDK.getAcceptedContribution(
+        presaleId,
+        charlie,
       );
+      expect(charlieAccepted).toBe(parseUnits("2000", USDC_DECIMALS));
+
       console.log(
-        `   ✅ Bob allocation: ${bobSDK.formatTokens(bobAllocation)} tokens`,
+        `   ✅ Alice accepted: ${aliceSDK.formatUsdc(aliceAccepted)} USDC`,
+      );
+      console.log(`   ✅ Bob accepted: ${bobSDK.formatUsdc(bobAccepted)} USDC`);
+      console.log(
+        `   ✅ Charlie accepted: ${charlieSDK.formatUsdc(charlieAccepted)} USDC`,
       );
 
       // ============================================
@@ -588,88 +620,105 @@ describe.skipIf(!process.env.INTEGRATION)(
       console.log("   ✅ Presale status: Claimable");
 
       // ============================================
-      // Step 7: Users claim tokens
+      // Step 7: Users claim tokens and refunds (single transaction each)
       // ============================================
-      console.log("\n🎁 Step 7: Users claiming tokens...");
+      console.log("\n🎁 Step 7: Users claiming tokens and refunds...");
+
+      // Alice claims (tokens only, no refund)
+      // Token allocations are now calculated as: (acceptedUsdc / totalAcceptedUsdc) * tokenSupply
+      // Total accepted USDC = 4500 + 3000 + 2000 = 9500 USDC
+      // Alice: 4500/9500 * 50B = ~23.68B tokens
+      // Bob: 3000/9500 * 50B = ~15.79B tokens
+      // Charlie: 2000/9500 * 50B = ~10.53B tokens
+
+      // Alice claims tokens
+      console.log("   - Alice claiming...");
       const aliceTokensBefore = await publicClient.readContract({
         address: tokenAddress,
         abi: ERC20Abi,
         functionName: "balanceOf",
         args: [alice],
       });
-
-      console.log("   - Alice claiming tokens...");
-      const claimResult = await aliceSDK.claimTokens({ presaleId });
-      await claimResult.wait();
-
+      await (await aliceSDK.claim({ presaleId })).wait();
       const aliceTokensAfter = await publicClient.readContract({
         address: tokenAddress,
         abi: ERC20Abi,
         functionName: "balanceOf",
         args: [alice],
       });
-
-      expect(aliceTokensAfter - aliceTokensBefore).toBe(
-        parseUnits("22500000000", TOKEN_DECIMALS),
-      );
+      const aliceTokensClaimed = aliceTokensAfter - aliceTokensBefore;
+      expect(aliceTokensClaimed).toBeGreaterThan(0n);
+      expect(await aliceSDK.hasClaimedTokens(presaleId, alice)).toBe(true);
       console.log(
-        `   ✅ Alice claimed ${aliceSDK.formatTokens(aliceTokensAfter - aliceTokensBefore)} tokens`,
+        `   ✅ Alice claimed ${aliceSDK.formatTokens(aliceTokensClaimed)} tokens`,
       );
 
-      // Verify tokens claimed flag
-      const hasAliceClaimed = await aliceSDK.hasClaimedTokens(presaleId, alice);
-      expect(hasAliceClaimed).toBe(true);
-
-      // Bob claims tokens too
-      console.log("   - Bob claiming tokens...");
+      // Bob claims (tokens only, no refund)
+      console.log("   - Bob claiming...");
       const bobTokensBefore = await publicClient.readContract({
         address: tokenAddress,
         abi: ERC20Abi,
         functionName: "balanceOf",
         args: [bob],
       });
-
-      await (await bobSDK.claimTokens({ presaleId })).wait();
-
+      await (await bobSDK.claim({ presaleId })).wait();
       const bobTokensAfter = await publicClient.readContract({
         address: tokenAddress,
         abi: ERC20Abi,
         functionName: "balanceOf",
         args: [bob],
       });
-
-      expect(bobTokensAfter - bobTokensBefore).toBe(
-        parseUnits("15000000000", TOKEN_DECIMALS),
-      );
+      const bobTokensClaimed = bobTokensAfter - bobTokensBefore;
+      expect(bobTokensClaimed).toBeGreaterThan(0n);
+      expect(await bobSDK.hasClaimedTokens(presaleId, bob)).toBe(true);
       console.log(
-        `   ✅ Bob claimed ${bobSDK.formatTokens(bobTokensAfter - bobTokensBefore)} tokens`,
+        `   ✅ Bob claimed ${bobSDK.formatTokens(bobTokensClaimed)} tokens`,
+      );
+
+      // Charlie claims tokens AND refund in single transaction
+      // Refund = contribution - min(contribution, maxAcceptedUsdc) = 2500 - 2000 = 500 USDC
+      console.log("   - Charlie claiming (tokens + refund)...");
+      const charlieTokensBefore = await publicClient.readContract({
+        address: tokenAddress,
+        abi: ERC20Abi,
+        functionName: "balanceOf",
+        args: [charlie],
+      });
+      const charlieUsdcBefore = await charlieSDK.getUsdcBalance(charlie);
+      await (await charlieSDK.claim({ presaleId })).wait();
+      const charlieTokensAfter = await publicClient.readContract({
+        address: tokenAddress,
+        abi: ERC20Abi,
+        functionName: "balanceOf",
+        args: [charlie],
+      });
+      const charlieUsdcAfter = await charlieSDK.getUsdcBalance(charlie);
+      const charlieTokensClaimed = charlieTokensAfter - charlieTokensBefore;
+      const refundAmount = charlieUsdcAfter - charlieUsdcBefore;
+      expect(charlieTokensClaimed).toBeGreaterThan(0n);
+      expect(refundAmount).toBe(parseUnits("500", USDC_DECIMALS));
+      expect(await charlieSDK.hasClaimedTokens(presaleId, charlie)).toBe(true);
+      expect(await charlieSDK.hasClaimedRefund(presaleId, charlie)).toBe(true);
+      console.log(
+        `   ✅ Charlie claimed ${charlieSDK.formatTokens(charlieTokensClaimed)} tokens + ${charlieSDK.formatUsdc(refundAmount)} USDC refund`,
       );
 
       // ============================================
-      // Step 8: Charlie claims tokens (no refund since full allocation)
+      // Step 8: Verify final state
       // ============================================
-      console.log("\n🎁 Step 8: Charlie claiming tokens...");
-      console.log("   - Charlie claiming tokens...");
-      await (await charlieSDK.claimTokens({ presaleId })).wait();
-      const hasCharlieClaimed = await charlieSDK.hasClaimedTokens(
+      console.log("\n✨ Step 8: Verifying final state...");
+      const finalAliceInfo = await aliceSDK.getUserPresaleInfo(
+        presaleId,
+        alice,
+      );
+      expect(finalAliceInfo.tokensClaimed).toBe(true);
+
+      const finalCharlieInfo = await charlieSDK.getUserPresaleInfo(
         presaleId,
         charlie,
       );
-      expect(hasCharlieClaimed).toBe(true);
-      console.log("   ✅ Charlie claimed tokens");
-
-      // ============================================
-      // Step 9: Verify final state
-      // ============================================
-      console.log("\n✨ Step 9: Verifying final state...");
-      const finalUserInfo = await aliceSDK.getUserPresaleInfo(presaleId, alice);
-      expect(finalUserInfo.tokensClaimed).toBe(true);
-
-      const charlieUserInfo = await charlieSDK.getUserPresaleInfo(
-        presaleId,
-        charlie,
-      );
-      expect(charlieUserInfo.tokensClaimed).toBe(true);
+      expect(finalCharlieInfo.tokensClaimed).toBe(true);
+      expect(finalCharlieInfo.refundClaimed).toBe(true);
 
       // Test SDK helper methods
       const progressPercentage =

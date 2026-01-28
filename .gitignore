@@ -1,6 +1,8 @@
 # Compiler files
 cache/
 out/
+sdk/node_modules
+sdk/dist
 
 # Ignores development broadcast logs
 !/broadcast

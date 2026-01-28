@@ -352,20 +352,7 @@ export const KarmaReputationPresaleV2Abi = [
     ],
     outputs: [{ name: "", type: "uint256" }],
   },
-  {
-    type: "function",
-    name: "getExpectedTokenSupply",
-    stateMutability: "view",
-    inputs: [{ name: "presaleId", type: "uint256" }],
-    outputs: [{ name: "", type: "uint256" }],
-  },
-  {
-    type: "function",
-    name: "getTotalAllocatedTokens",
-    stateMutability: "view",
-    inputs: [{ name: "presaleId", type: "uint256" }],
-    outputs: [{ name: "", type: "uint256" }],
-  },
+
   {
     type: "function",
     name: "contributions",
@@ -479,31 +466,47 @@ export const KarmaReputationPresaleV2Abi = [
   },
   {
     type: "function",
-    name: "claimTokens",
+    name: "claim",
     stateMutability: "nonpayable",
     inputs: [{ name: "presaleId", type: "uint256" }],
-    outputs: [],
-  },
-  {
-    type: "function",
-    name: "claimRefund",
-    stateMutability: "nonpayable",
-    inputs: [{ name: "presaleId", type: "uint256" }],
-    outputs: [],
+    outputs: [
+      { name: "tokenAmount", type: "uint256" },
+      { name: "refundAmount", type: "uint256" },
+    ],
   },
 
   // Admin Functions
   {
     type: "function",
-    name: "uploadAllocation",
+    name: "setMaxAcceptedUsdc",
     stateMutability: "nonpayable",
     inputs: [
       { name: "presaleId", type: "uint256" },
       { name: "user", type: "address" },
-      { name: "tokenAmount", type: "uint256" },
-      { name: "acceptedUsdc", type: "uint256" },
+      { name: "maxUsdc", type: "uint256" },
     ],
     outputs: [],
+  },
+  {
+    type: "function",
+    name: "batchSetMaxAcceptedUsdc",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "presaleId", type: "uint256" },
+      { name: "users", type: "address[]" },
+      { name: "maxUsdcAmounts", type: "uint256[]" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "maxAcceptedUsdc",
+    stateMutability: "view",
+    inputs: [
+      { name: "presaleId", type: "uint256" },
+      { name: "user", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
   },
   {
     type: "function",
