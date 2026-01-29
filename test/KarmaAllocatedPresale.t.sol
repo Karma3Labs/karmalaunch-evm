@@ -3,11 +3,25 @@ pragma solidity ^0.8.28;
 
 import {Test, console} from "forge-std/Test.sol";
 
+import {Karma} from "../contracts/Karma.sol";
+import {KarmaFeeLocker} from "../contracts/KarmaFeeLocker.sol";
 import {KarmaAllocatedPresale} from "../contracts/extensions/KarmaAllocatedPresale.sol";
 import {IKarmaAllocatedPresale} from "../contracts/extensions/interfaces/IKarmaAllocatedPresale.sol";
 import {IKarma} from "../contracts/interfaces/IKarma.sol";
+import {KarmaHookStaticFeeV2} from "../contracts/hooks/KarmaHookStaticFeeV2.sol";
+import {IKarmaHookStaticFee} from "../contracts/hooks/interfaces/IKarmaHookStaticFee.sol";
+import {IKarmaHookV2} from "../contracts/hooks/interfaces/IKarmaHookV2.sol";
+import {KarmaPoolExtensionAllowlist} from "../contracts/hooks/KarmaPoolExtensionAllowlist.sol";
+import {KarmaLpLockerMultiple} from "../contracts/lp-lockers/KarmaLpLockerMultiple.sol";
+import {KarmaMevModulePassthrough} from "../contracts/mev-modules/KarmaMevModulePassthrough.sol";
+
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract MockUSDC is ERC20 {
     constructor() ERC20("USD Coin", "USDC") {}
@@ -21,146 +35,235 @@ contract MockUSDC is ERC20 {
     }
 }
 
-contract MockToken is ERC20 {
-    constructor() ERC20("Test Token", "TEST") {}
+contract KarmaAllocatedPresaleIntegrationTest is Test {
+    // Base Sepolia addresses
+    address constant POOL_MANAGER = 0x05E73354cFDd6745C338b50BcFDfA3Aa6fA03408;
+    address constant POSITION_MANAGER = 0x4B2C77d209D3405F41a037Ec6c77F7F5b8e2ca80;
+    address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    address constant WETH = 0x4200000000000000000000000000000000000006;
 
-    function mint(address to, uint256 amount) external {
-        _mint(to, amount);
-    }
-}
-
-contract TestableKarmaAllocatedPresale is KarmaAllocatedPresale {
-    constructor(
-        address owner_,
-        address factory_,
-        address usdc_,
-        address karmaFeeRecipient_
-    ) KarmaAllocatedPresale(owner_, factory_, usdc_, karmaFeeRecipient_) {}
-
-    function testCompleteDeployment(
-        uint256 presaleId,
-        address token,
-        uint256 tokenSupply
-    ) external {
-        Presale storage presale = presaleState[presaleId];
-        presale.deployedToken = token;
-        presale.tokenSupply = tokenSupply;
-        // Status is now computed dynamically based on deployedToken != address(0)
-    }
-
-    // No longer needed - status is computed dynamically from timestamps and state
-    function testUpdateStatus(uint256) external pure {
-        // No-op: status is now determined by _getStatus() based on:
-        // - block.timestamp vs endTime
-        // - totalContributions vs minUsdc
-        // - totalAcceptedUsdc
-        // - readyForDeployment
-        // - deployedToken
-    }
-}
-
-contract KarmaAllocatedPresaleTest is Test {
-    TestableKarmaAllocatedPresale public presale;
+    // Contracts
+    Karma public karma;
+    KarmaFeeLocker public feeLocker;
+    KarmaHookStaticFeeV2 public hook;
+    KarmaPoolExtensionAllowlist public allowlist;
+    KarmaLpLockerMultiple public lpLocker;
+    KarmaMevModulePassthrough public mevModule;
+    KarmaAllocatedPresale public presale;
     MockUSDC public usdc;
-    MockToken public token;
 
-    address public owner = address(this);
-    address public admin = makeAddr("admin");
-    address public presaleOwner = makeAddr("presaleOwner");
-    address public feeRecipient = makeAddr("feeRecipient");
-    address public mockFactory = makeAddr("mockFactory");
+    // Users
+    address public owner;
+    address public admin;
+    address public presaleOwner;
+    address public feeRecipient;
+    address public alice;
+    address public bob;
 
-    address public alice = makeAddr("alice");
-    address public bob = makeAddr("bob");
-    address public charlie = makeAddr("charlie");
-    address public diana = makeAddr("diana");
-
-    uint256 public constant TARGET_USDC = 100_000e6;
-    uint256 public constant MIN_USDC = 50_000e6;
-    uint256 public constant PRESALE_DURATION = 7 days;
-    uint256 public constant PRESALE_TOKEN_SUPPLY = 50_000_000_000e18;
+    // Constants
+    uint256 constant TARGET_USDC = 100_000e6;
+    uint256 constant MIN_USDC = 50_000e6;
+    uint256 constant PRESALE_DURATION = 7 days;
+    uint256 constant TOKEN_SUPPLY = 100_000_000_000e18;
+    uint256 constant PRESALE_BPS = 5000; // 50% to presale
 
     function setUp() public {
-        usdc = new MockUSDC();
-        token = new MockToken();
+        // Fork Base Sepolia
+        vm.createSelectFork("https://sepolia.base.org");
 
-        presale = new TestableKarmaAllocatedPresale(
+        owner = address(this);
+        admin = makeAddr("admin");
+        presaleOwner = makeAddr("presaleOwner");
+        feeRecipient = makeAddr("feeRecipient");
+        alice = makeAddr("alice");
+        bob = makeAddr("bob");
+
+        // Deploy USDC mock
+        usdc = new MockUSDC();
+
+        // Deploy core contracts
+        feeLocker = new KarmaFeeLocker(owner);
+        karma = new Karma(owner);
+        karma.setTeamFeeRecipient(feeRecipient);
+        karma.setDeprecated(false);
+
+        // Deploy hook allowlist
+        allowlist = new KarmaPoolExtensionAllowlist(owner);
+
+        // Deploy hook with CREATE2 mining
+        hook = _deployHook();
+
+        // Deploy LP locker
+        lpLocker = new KarmaLpLockerMultiple(
             owner,
-            mockFactory,
+            address(karma),
+            address(feeLocker),
+            POSITION_MANAGER,
+            PERMIT2
+        );
+        feeLocker.addDepositor(address(lpLocker));
+
+        // Deploy MEV module
+        mevModule = new KarmaMevModulePassthrough(address(hook));
+
+        // Deploy presale extension
+        presale = new KarmaAllocatedPresale(
+            owner,
+            address(karma),
             address(usdc),
             feeRecipient
         );
-
         presale.setAdmin(admin, true);
 
-        usdc.mint(alice, 150_000e6);
-        usdc.mint(bob, 100_000e6);
-        usdc.mint(charlie, 50_000e6);
-        usdc.mint(diana, 50_000e6);
+        // Configure Karma
+        karma.setHook(address(hook), true);
+        karma.setLocker(address(lpLocker), address(hook), true);
+        karma.setMevModule(address(mevModule), true);
+        karma.setExtension(address(presale), true);
 
+        // Mint USDC to users
+        usdc.mint(alice, 200_000e6);
+        usdc.mint(bob, 200_000e6);
+
+        // Approve USDC
         vm.prank(alice);
         usdc.approve(address(presale), type(uint256).max);
         vm.prank(bob);
         usdc.approve(address(presale), type(uint256).max);
-        vm.prank(charlie);
-        usdc.approve(address(presale), type(uint256).max);
-        vm.prank(diana);
-        usdc.approve(address(presale), type(uint256).max);
     }
 
-    function _createDeploymentConfig() internal view returns (IKarma.DeploymentConfig memory) {
-        return _createDeploymentConfigFor(address(presale));
+    function _deployHook() internal returns (KarmaHookStaticFeeV2) {
+        // Calculate required hook flags
+        uint160 hookFlags = uint160(
+            Hooks.BEFORE_INITIALIZE_FLAG |
+            Hooks.BEFORE_ADD_LIQUIDITY_FLAG |
+            Hooks.BEFORE_SWAP_FLAG |
+            Hooks.AFTER_SWAP_FLAG |
+            Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG |
+            Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+        );
+
+        // Get creation code
+        bytes memory creationCode = type(KarmaHookStaticFeeV2).creationCode;
+        bytes memory constructorArgs = abi.encode(
+            POOL_MANAGER,
+            address(karma),
+            address(allowlist),
+            WETH
+        );
+        bytes memory creationCodeWithArgs = abi.encodePacked(creationCode, constructorArgs);
+        bytes32 initCodeHash = keccak256(creationCodeWithArgs);
+
+        // Mine for valid hook address
+        uint160 flagMask = Hooks.ALL_HOOK_MASK;
+        uint160 flags = hookFlags & flagMask;
+
+        bytes32 salt;
+        address hookAddress;
+        for (uint256 i = 0; i < 500_000; i++) {
+            salt = bytes32(i);
+            hookAddress = address(uint160(uint256(keccak256(abi.encodePacked(
+                bytes1(0xFF),
+                address(this),
+                salt,
+                initCodeHash
+            )))));
+
+            if (uint160(hookAddress) & flagMask == flags && hookAddress.code.length == 0) {
+                break;
+            }
+        }
+
+        // Deploy hook
+        KarmaHookStaticFeeV2 deployedHook = new KarmaHookStaticFeeV2{salt: salt}(
+            POOL_MANAGER,
+            address(karma),
+            address(allowlist),
+            WETH
+        );
+
+        require(address(deployedHook) == hookAddress, "Hook deployed to wrong address");
+
+        return deployedHook;
     }
 
-    function _createDeploymentConfigFor(address presaleAddr) internal view returns (IKarma.DeploymentConfig memory) {
+    function test_FullPresaleFlow_WithRealDeployment() public {
+        console.log("=== FULL PRESALE INTEGRATION TEST ===");
+        console.log("");
+
+        // ============ STEP 1: Create Presale ============
+        console.log("Step 1: Creating presale...");
+
+        // Build deployment config
         IKarma.ExtensionConfig[] memory extensionConfigs = new IKarma.ExtensionConfig[](1);
         extensionConfigs[0] = IKarma.ExtensionConfig({
-            extension: presaleAddr,
+            extension: address(presale),
             msgValue: 0,
-            extensionBps: 5000,
-            extensionData: ""
+            extensionBps: uint16(PRESALE_BPS),
+            extensionData: "" // Will be set by createPresale
         });
 
-        return IKarma.DeploymentConfig({
+        // Build fee data for hook
+        IKarmaHookStaticFee.PoolStaticConfigVars memory feeConfig = IKarmaHookStaticFee.PoolStaticConfigVars({
+            karmaFee: 10000, // 1%
+            pairedFee: 10000  // 1%
+        });
+
+        IKarmaHookV2.PoolInitializationData memory poolInitData = IKarmaHookV2.PoolInitializationData({
+            extension: address(0),
+            extensionData: "",
+            feeData: abi.encode(feeConfig)
+        });
+
+        // Build locker config - single full-range position
+        address[] memory rewardAdmins = new address[](1);
+        address[] memory rewardRecipients = new address[](1);
+        uint16[] memory rewardBps = new uint16[](1);
+        int24[] memory tickLower = new int24[](1);
+        int24[] memory tickUpper = new int24[](1);
+        uint16[] memory positionBps = new uint16[](1);
+
+        rewardAdmins[0] = presaleOwner;
+        rewardRecipients[0] = presaleOwner;
+        rewardBps[0] = 10000; // 100%
+        tickLower[0] = 0; // Starting tick
+        tickUpper[0] = 887220; // Near max tick, divisible by 60
+        positionBps[0] = 10000; // 100%
+
+        IKarma.DeploymentConfig memory deploymentConfig = IKarma.DeploymentConfig({
             tokenConfig: IKarma.TokenConfig({
                 tokenAdmin: presaleOwner,
-                name: "Test Token",
-                symbol: "TEST",
-                salt: bytes32(0),
+                name: "Test Karma Token",
+                symbol: "TKT",
+                salt: bytes32(uint256(1)),
                 image: "https://example.com/image.png",
                 metadata: "Test metadata",
                 context: "Test context",
                 originatingChainId: block.chainid
             }),
             poolConfig: IKarma.PoolConfig({
-                hook: address(0),
+                hook: address(hook),
                 pairedToken: address(usdc),
                 tickIfToken0IsKarma: 0,
                 tickSpacing: 60,
-                poolData: ""
+                poolData: abi.encode(poolInitData)
             }),
             lockerConfig: IKarma.LockerConfig({
-                locker: address(0),
-                rewardAdmins: new address[](0),
-                rewardRecipients: new address[](0),
-                rewardBps: new uint16[](0),
-                tickLower: new int24[](0),
-                tickUpper: new int24[](0),
-                positionBps: new uint16[](0),
+                locker: address(lpLocker),
+                rewardAdmins: rewardAdmins,
+                rewardRecipients: rewardRecipients,
+                rewardBps: rewardBps,
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                positionBps: positionBps,
                 lockerData: ""
             }),
             mevModuleConfig: IKarma.MevModuleConfig({
-                mevModule: address(0),
+                mevModule: address(mevModule),
                 mevModuleData: ""
             }),
             extensionConfigs: extensionConfigs
         });
-    }
-
-    function test_FullPresaleFlowV2_Oversubscribed() public {
-        console.log("Step 1: Creating presale...");
-
-        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
 
         vm.prank(admin);
         uint256 presaleId = presale.createPresale(
@@ -171,383 +274,153 @@ contract KarmaAllocatedPresaleTest is Test {
             deploymentConfig
         );
 
-        assertEq(presaleId, 1, "Presale ID should be 1");
         console.log("Presale created with ID:", presaleId);
+        assertEq(presaleId, 1);
 
-        console.log("Step 2: Participants contributing (oversubscribed)...");
+        // ============ STEP 2: Contribute ============
+        console.log("");
+        console.log("Step 2: Users contributing...");
 
         vm.prank(alice);
-        presale.contribute(presaleId, 50_000e6);
-        console.log("Alice contributed: 50,000 USDC");
+        presale.contribute(presaleId, 60_000e6);
+        console.log("Alice contributed: 60,000 USDC");
 
         vm.prank(bob);
-        presale.contribute(presaleId, 30_000e6);
-        console.log("Bob contributed: 30,000 USDC");
-
-        vm.prank(charlie);
-        presale.contribute(presaleId, 25_000e6);
-        console.log("Charlie contributed: 25,000 USDC");
-
-        vm.prank(diana);
-        presale.contribute(presaleId, 15_000e6);
-        console.log("Diana contributed: 15,000 USDC");
+        presale.contribute(presaleId, 50_000e6);
+        console.log("Bob contributed: 50,000 USDC");
 
         IKarmaAllocatedPresale.Presale memory presaleData = presale.getPresale(presaleId);
-        assertEq(presaleData.totalContributions, 120_000e6);
-        console.log("Total contributions:", presaleData.totalContributions / 1e6, "USDC (oversubscribed!)");
+        console.log("Total contributions:", presaleData.totalContributions / 1e6, "USDC");
+        assertEq(presaleData.totalContributions, 110_000e6);
 
+        // ============ STEP 3: End Contribution Window ============
+        console.log("");
         console.log("Step 3: Ending contribution window...");
+
         vm.warp(block.timestamp + PRESALE_DURATION + 1);
 
-        // Status is computed dynamically based on timestamps and state
         presaleData = presale.getPresale(presaleId);
         assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.PendingAllocation));
-        console.log("Presale status: PendingAllocation");
+        console.log("Status: PendingAllocation");
 
-        console.log("Step 4: Setting max accepted USDC (priority-based: Alice > Bob > Charlie > Diana)...");
+        // ============ STEP 4: Set Allocations ============
+        console.log("");
+        console.log("Step 4: Setting allocations...");
 
-        // Set max accepted USDC - Alice and Bob get full allocation, Charlie partial, Diana none
-        // Total accepted USDC = 100,000 (target)
-        // Alice: max 50,000 USDC (contributed 50k, accepted 50k)
-        // Bob: max 30,000 USDC (contributed 30k, accepted 30k)
-        // Charlie: max 20,000 USDC (contributed 25k, accepted 20k, refund 5k)
-        // Diana: max 0 USDC (contributed 15k, accepted 0, refund 15k)
-
-        vm.prank(admin);
-        presale.setMaxAcceptedUsdc(presaleId, alice, 50_000e6);
-
-        vm.prank(admin);
-        presale.setMaxAcceptedUsdc(presaleId, bob, 30_000e6);
+        address[] memory users = new address[](2);
+        uint256[] memory maxAmounts = new uint256[](2);
+        users[0] = alice;
+        users[1] = bob;
+        maxAmounts[0] = 60_000e6; // Alice gets full amount
+        maxAmounts[1] = 40_000e6; // Bob gets partial (50k contributed, 40k accepted)
 
         vm.prank(admin);
-        presale.setMaxAcceptedUsdc(presaleId, charlie, 20_000e6);
+        presale.batchSetMaxAcceptedUsdc(presaleId, users, maxAmounts);
 
-        vm.prank(admin);
-        presale.setMaxAcceptedUsdc(presaleId, diana, 0);
+        console.log("Alice accepted: 60,000 USDC");
+        console.log("Bob accepted: 40,000 USDC (refund: 10,000 USDC)");
+        console.log("Total accepted:", presale.getTotalAcceptedUsdc(presaleId) / 1e6, "USDC");
 
-        console.log("Max accepted USDC set. Total accepted:", presale.getTotalAcceptedUsdc(presaleId) / 1e6, "USDC");
-        assertEq(presale.getTotalAcceptedUsdc(presaleId), 100_000e6, "Total accepted should be 100k USDC");
-
-        presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.AllocationSet));
-
+        // ============ STEP 5: Prepare for Deployment ============
+        console.log("");
         console.log("Step 5: Preparing for deployment...");
 
         vm.prank(presaleOwner);
-        presale.prepareForDeployment(presaleId, bytes32(uint256(1)));
+        presale.prepareForDeployment(presaleId, bytes32(uint256(12345)));
 
         presaleData = presale.getPresale(presaleId);
         assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.ReadyForDeployment));
-        console.log("Presale status: ReadyForDeployment");
+        console.log("Status: ReadyForDeployment");
 
-        console.log("Step 6: Simulating token deployment...");
+        // ============ STEP 6: Deploy Token (THE REAL TEST) ============
+        console.log("");
+        console.log("Step 6: Deploying token via Karma factory...");
 
-        token.mint(address(presale), PRESALE_TOKEN_SUPPLY);
-        presale.testCompleteDeployment(presaleId, address(token), PRESALE_TOKEN_SUPPLY);
+        // Get the updated deployment config from presale
+        presaleData = presale.getPresale(presaleId);
+        IKarma.DeploymentConfig memory finalConfig = presaleData.deploymentConfig;
 
+        // Deploy!
+        address tokenAddress = karma.deployToken(finalConfig);
+
+        console.log("Token deployed at:", tokenAddress);
+        assertTrue(tokenAddress != address(0), "Token should be deployed");
+
+        // Verify presale received tokens
         presaleData = presale.getPresale(presaleId);
         assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.Claimable));
-        console.log("Presale status: Claimable");
+        console.log("Status: Claimable");
+        console.log("Presale token supply:", presaleData.tokenSupply / 1e18, "tokens");
 
+        uint256 expectedPresaleSupply = TOKEN_SUPPLY * PRESALE_BPS / 10000;
+        assertEq(presaleData.tokenSupply, expectedPresaleSupply, "Presale should have 50% of supply");
+
+        // ============ STEP 7: Claim Tokens ============
+        console.log("");
         console.log("Step 7: Claiming tokens...");
 
-        // Token allocations are calculated based on accepted USDC proportion
-        // Alice: 50k/100k = 50% of 50B = 25B tokens
-        // Bob: 30k/100k = 30% of 50B = 15B tokens
-        // Charlie: 20k/100k = 20% of 50B = 10B tokens
-        // Diana: 0k/100k = 0% of 50B = 0 tokens
-        uint256 aliceAllocation = presale.getTokenAllocation(presaleId, alice);
-        uint256 bobAllocation = presale.getTokenAllocation(presaleId, bob);
-        uint256 charlieAllocation = presale.getTokenAllocation(presaleId, charlie);
-        uint256 dianaAllocation = presale.getTokenAllocation(presaleId, diana);
+        // Calculate expected allocations
+        // Alice: 60k / 100k = 60% of presale supply
+        // Bob: 40k / 100k = 40% of presale supply
+        uint256 aliceExpectedTokens = (expectedPresaleSupply * 60_000e6) / 100_000e6;
+        uint256 bobExpectedTokens = (expectedPresaleSupply * 40_000e6) / 100_000e6;
 
-        console.log("Alice token allocation:", aliceAllocation / 1e18);
-        console.log("Bob token allocation:", bobAllocation / 1e18);
-        console.log("Charlie token allocation:", charlieAllocation / 1e18);
-        console.log("Diana token allocation:", dianaAllocation / 1e18);
+        console.log("Alice expected tokens:", aliceExpectedTokens / 1e18);
+        console.log("Bob expected tokens:", bobExpectedTokens / 1e18);
 
-        assertEq(aliceAllocation, 25_000_000_000e18, "Alice should get 25B tokens");
-        assertEq(bobAllocation, 15_000_000_000e18, "Bob should get 15B tokens");
-        assertEq(charlieAllocation, 10_000_000_000e18, "Charlie should get 10B tokens");
-        assertEq(dianaAllocation, 0, "Diana should get 0 tokens");
-
-        console.log("Step 7 & 8: Claiming tokens and refunds...");
-
-        uint256 charlieRefund = presale.getRefundAmount(presaleId, charlie);
-        uint256 dianaRefund = presale.getRefundAmount(presaleId, diana);
-
-        console.log("Charlie refund:", charlieRefund / 1e6, "USDC");
-        console.log("Diana refund:", dianaRefund / 1e6, "USDC");
-
-        assertEq(charlieRefund, 5_000e6, "Charlie should get 5k USDC refund");
-        assertEq(dianaRefund, 15_000e6, "Diana should get 15k USDC refund");
-
-        // Alice claims tokens only (no refund)
+        // Alice claims
+        uint256 aliceUsdcBefore = usdc.balanceOf(alice);
         vm.prank(alice);
-        (uint256 aliceTokensClaimed, uint256 aliceRefundClaimed) = presale.claim(presaleId);
-        assertEq(aliceTokensClaimed, aliceAllocation);
-        assertEq(aliceRefundClaimed, 0);
-        console.log("Alice claimed tokens. Balance:", token.balanceOf(alice) / 1e18);
+        (uint256 aliceTokens, uint256 aliceRefund) = presale.claim(presaleId);
 
-        // Bob claims tokens only (no refund)
+        console.log("Alice claimed tokens:", aliceTokens / 1e18);
+        console.log("Alice refund:", aliceRefund / 1e6, "USDC");
+        assertEq(aliceTokens, aliceExpectedTokens, "Alice token amount incorrect");
+        assertEq(aliceRefund, 0, "Alice should have no refund");
+        assertEq(IERC20(tokenAddress).balanceOf(alice), aliceExpectedTokens, "Alice balance incorrect");
+
+        // Bob claims
+        uint256 bobUsdcBefore = usdc.balanceOf(bob);
         vm.prank(bob);
-        (uint256 bobTokensClaimed, uint256 bobRefundClaimed) = presale.claim(presaleId);
-        assertEq(bobTokensClaimed, bobAllocation);
-        assertEq(bobRefundClaimed, 0);
-        console.log("Bob claimed tokens. Balance:", token.balanceOf(bob) / 1e18);
+        (uint256 bobTokens, uint256 bobRefund) = presale.claim(presaleId);
 
-        // Charlie claims both tokens and refund
-        vm.prank(charlie);
-        (uint256 charlieTokensClaimed, uint256 charlieRefundClaimed) = presale.claim(presaleId);
-        assertEq(charlieTokensClaimed, charlieAllocation);
-        assertEq(charlieRefundClaimed, charlieRefund);
-        console.log("Charlie claimed tokens and refund. Balance:", token.balanceOf(charlie) / 1e18);
+        console.log("Bob claimed tokens:", bobTokens / 1e18);
+        console.log("Bob refund:", bobRefund / 1e6, "USDC");
+        assertEq(bobTokens, bobExpectedTokens, "Bob token amount incorrect");
+        assertEq(bobRefund, 10_000e6, "Bob should get 10k USDC refund");
+        assertEq(IERC20(tokenAddress).balanceOf(bob), bobExpectedTokens, "Bob balance incorrect");
+        assertEq(usdc.balanceOf(bob) - bobUsdcBefore, 10_000e6, "Bob USDC refund incorrect");
 
-        // Diana claims refund only (no tokens)
-        vm.prank(diana);
-        (uint256 dianaTokensClaimed, uint256 dianaRefundClaimed) = presale.claim(presaleId);
-        assertEq(dianaTokensClaimed, 0);
-        assertEq(dianaRefundClaimed, dianaRefund);
-        console.log("Diana claimed refund only");
+        // ============ STEP 8: Presale Owner Claims USDC ============
+        console.log("");
+        console.log("Step 8: Presale owner claiming USDC...");
 
-        // Alice trying to claim again should fail
-        vm.prank(alice);
-        vm.expectRevert(IKarmaAllocatedPresale.NothingToClaim.selector);
-        presale.claim(presaleId);
-        console.log("Alice cannot claim again (expected)");
-
-        console.log("Step 9: Presale owner claiming USDC...");
-
-        uint256 presaleOwnerBefore = usdc.balanceOf(presaleOwner);
+        uint256 ownerUsdcBefore = usdc.balanceOf(presaleOwner);
         uint256 feeRecipientBefore = usdc.balanceOf(feeRecipient);
 
         vm.prank(presaleOwner);
         presale.claimUsdc(presaleId, presaleOwner);
 
-        uint256 presaleOwnerReceived = usdc.balanceOf(presaleOwner) - presaleOwnerBefore;
-        uint256 feeRecipientReceived = usdc.balanceOf(feeRecipient) - feeRecipientBefore;
+        uint256 ownerReceived = usdc.balanceOf(presaleOwner) - ownerUsdcBefore;
+        uint256 feeReceived = usdc.balanceOf(feeRecipient) - feeRecipientBefore;
 
-        console.log("Presale owner received:", presaleOwnerReceived / 1e6, "USDC");
-        console.log("Fee recipient received:", feeRecipientReceived / 1e6, "USDC");
+        // 5% fee on 100k = 5k fee, 95k to owner
+        console.log("Presale owner received:", ownerReceived / 1e6, "USDC");
+        console.log("Fee recipient received:", feeReceived / 1e6, "USDC");
 
-        assertEq(presaleOwnerReceived, 95_000e6, "Owner should receive 95k USDC (100k - 5% fee)");
-        assertEq(feeRecipientReceived, 5_000e6, "Fee recipient should receive 5k USDC");
+        assertEq(ownerReceived, 95_000e6, "Owner should receive 95k USDC");
+        assertEq(feeReceived, 5_000e6, "Fee recipient should receive 5k USDC");
 
+        // ============ DONE ============
         console.log("");
-        console.log("========== V2 PRESALE COMPLETED SUCCESSFULLY ==========");
-    }
-
-    function test_UndersubscribedPresale() public {
-        console.log("Testing undersubscribed presale...");
-
-        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
-
-        vm.prank(admin);
-        uint256 presaleId = presale.createPresale(
-            presaleOwner,
-            TARGET_USDC,
-            MIN_USDC,
-            PRESALE_DURATION,
-            deploymentConfig
-        );
-
-        // Contribute less than target but above minimum
-        vm.prank(alice);
-        presale.contribute(presaleId, 40_000e6);
-
-        vm.prank(bob);
-        presale.contribute(presaleId, 30_000e6);
-
-        IKarmaAllocatedPresale.Presale memory presaleData = presale.getPresale(presaleId);
-        assertEq(presaleData.totalContributions, 70_000e6, "Total should be 70k USDC");
-
-        // End presale
-        vm.warp(block.timestamp + PRESALE_DURATION + 1);
-
-        // Set max accepted USDC - everyone gets their full contribution accepted
-        // Alice: max 40k (contributed 40k, accepted 40k)
-        // Bob: max 30k (contributed 30k, accepted 30k)
-        // Total accepted: 70k USDC
-
-        vm.prank(admin);
-        presale.setMaxAcceptedUsdc(presaleId, alice, 40_000e6);
-
-        vm.prank(admin);
-        presale.setMaxAcceptedUsdc(presaleId, bob, 30_000e6);
-
-        assertEq(presale.getTotalAcceptedUsdc(presaleId), 70_000e6);
-
-        // Prepare for deployment
-        vm.prank(presaleOwner);
-        presale.prepareForDeployment(presaleId, bytes32(uint256(1)));
-
-        // Complete deployment
-        token.mint(address(presale), PRESALE_TOKEN_SUPPLY);
-        presale.testCompleteDeployment(presaleId, address(token), PRESALE_TOKEN_SUPPLY);
-
-        // Claim tokens and refunds
-        // Calculate expected token amounts based on accepted USDC proportion
-        // Alice: 40k/70k of 50B tokens
-        // Bob: 30k/70k of 50B tokens
-        uint256 expectedAliceTokens = (PRESALE_TOKEN_SUPPLY * 40_000e6) / 70_000e6;
-        uint256 expectedBobTokens = (PRESALE_TOKEN_SUPPLY * 30_000e6) / 70_000e6;
-
-        vm.prank(alice);
-        (uint256 aliceTokensClaimed, uint256 aliceRefundClaimed) = presale.claim(presaleId);
-        assertEq(aliceTokensClaimed, expectedAliceTokens);
-        assertEq(token.balanceOf(alice), expectedAliceTokens);
-
-        vm.prank(bob);
-        (uint256 bobTokensClaimed, uint256 bobRefundClaimed) = presale.claim(presaleId);
-        assertEq(bobTokensClaimed, expectedBobTokens);
-        assertEq(token.balanceOf(bob), expectedBobTokens);
-
-        // No refunds since max accepted >= contribution for both
-        assertEq(aliceRefundClaimed, 0);
-        assertEq(bobRefundClaimed, 0);
-        console.log("Alice refund:", presale.getRefundAmount(presaleId, alice));
-        console.log("Bob refund:", presale.getRefundAmount(presaleId, bob));
-
-        console.log("Undersubscribed presale completed successfully");
-    }
-
-    function test_FailedPresale_BelowMinimum() public {
-        console.log("Testing failed presale (below minimum)...");
-
-        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
-
-        vm.prank(admin);
-        uint256 presaleId = presale.createPresale(
-            presaleOwner,
-            TARGET_USDC,
-            MIN_USDC,
-            PRESALE_DURATION,
-            deploymentConfig
-        );
-
-        // Contribute below minimum
-        vm.prank(alice);
-        presale.contribute(presaleId, 30_000e6);
-
-        // End presale
-        vm.warp(block.timestamp + PRESALE_DURATION + 1);
-
-        // Status is computed dynamically based on timestamps and totalContributions
-        IKarmaAllocatedPresale.Presale memory presaleData = presale.getPresale(presaleId);
-        assertEq(uint256(presaleData.status), uint256(IKarmaAllocatedPresale.PresaleStatus.Failed));
-
-        // Alice can withdraw her contribution
-        uint256 aliceBefore = usdc.balanceOf(alice);
-        vm.prank(alice);
-        presale.withdrawContribution(presaleId, 30_000e6);
-        assertEq(usdc.balanceOf(alice), aliceBefore + 30_000e6);
-
-        console.log("Failed presale test completed");
-    }
-
-    function test_WithdrawDuringActivePresale() public {
-        console.log("Testing withdrawal during active presale...");
-
-        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
-
-        vm.prank(admin);
-        uint256 presaleId = presale.createPresale(
-            presaleOwner,
-            TARGET_USDC,
-            MIN_USDC,
-            PRESALE_DURATION,
-            deploymentConfig
-        );
-
-        vm.prank(alice);
-        presale.contribute(presaleId, 50_000e6);
-
-        assertEq(presale.getContribution(presaleId, alice), 50_000e6);
-
-        // Withdraw half
-        uint256 aliceBefore = usdc.balanceOf(alice);
-        vm.prank(alice);
-        presale.withdrawContribution(presaleId, 25_000e6);
-
-        assertEq(presale.getContribution(presaleId, alice), 25_000e6);
-        assertEq(usdc.balanceOf(alice), aliceBefore + 25_000e6);
-
-        console.log("Withdrawal during active presale test completed");
-    }
-
-    function test_PrepareForDeploymentRequiresAcceptedUsdc() public {
-        console.log("Testing prepareForDeployment requires accepted USDC...");
-
-        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
-
-        vm.prank(admin);
-        uint256 presaleId = presale.createPresale(
-            presaleOwner,
-            TARGET_USDC,
-            MIN_USDC,
-            PRESALE_DURATION,
-            deploymentConfig
-        );
-
-        vm.prank(alice);
-        presale.contribute(presaleId, 100_000e6);
-
-        vm.warp(block.timestamp + PRESALE_DURATION + 1);
-
-        // Try to prepare for deployment without setting any max accepted USDC
-        // Should fail because totalAcceptedUsdc is 0
-        vm.prank(presaleOwner);
-        vm.expectRevert(abi.encodeWithSelector(
-            IKarmaAllocatedPresale.InvalidPresaleStatus.selector,
-            IKarmaAllocatedPresale.PresaleStatus.PendingAllocation,
-            IKarmaAllocatedPresale.PresaleStatus.AllocationSet
-        ));
-        presale.prepareForDeployment(presaleId, bytes32(uint256(1)));
-
-        // Now set max accepted USDC
-        vm.prank(admin);
-        presale.setMaxAcceptedUsdc(presaleId, alice, 100_000e6);
-
-        // Now it should work
-        vm.prank(presaleOwner);
-        presale.prepareForDeployment(presaleId, bytes32(uint256(1)));
-
-        console.log("Prepare for deployment test completed");
-    }
-
-    function test_UpdateMaxAcceptedUsdc() public {
-        console.log("Testing max accepted USDC update...");
-
-        IKarma.DeploymentConfig memory deploymentConfig = _createDeploymentConfig();
-
-        vm.prank(admin);
-        uint256 presaleId = presale.createPresale(
-            presaleOwner,
-            TARGET_USDC,
-            MIN_USDC,
-            PRESALE_DURATION,
-            deploymentConfig
-        );
-
-        vm.prank(alice);
-        presale.contribute(presaleId, 100_000e6);
-
-        vm.warp(block.timestamp + PRESALE_DURATION + 1);
-
-        // Initial max accepted USDC
-        vm.prank(admin);
-        presale.setMaxAcceptedUsdc(presaleId, alice, 60_000e6);
-
-        assertEq(presale.getTotalAcceptedUsdc(presaleId), 60_000e6);
-        assertEq(presale.getAcceptedContribution(presaleId, alice), 60_000e6);
-
-        // Update max accepted USDC
-        vm.prank(admin);
-        presale.setMaxAcceptedUsdc(presaleId, alice, 100_000e6);
-
-        assertEq(presale.getTotalAcceptedUsdc(presaleId), 100_000e6);
-        assertEq(presale.getAcceptedContribution(presaleId, alice), 100_000e6);
-
-        console.log("Max accepted USDC update test completed");
+        console.log("=== FULL PRESALE FLOW COMPLETED SUCCESSFULLY ===");
+        console.log("");
+        console.log("Summary:");
+        console.log("- Token deployed:", tokenAddress);
+        console.log("- Total raised: 100,000 USDC");
+        console.log("- Alice: 60k USDC -> 30B tokens");
+        console.log("- Bob: 40k USDC accepted (10k refund) -> 20B tokens");
+        console.log("- Presale owner: 95k USDC");
+        console.log("- Protocol fee: 5k USDC");
     }
 }

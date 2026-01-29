@@ -139,6 +139,30 @@ export interface ClaimUsdcParams {
   recipient: Address;
 }
 
+export interface CreatePresaleParams {
+  presaleOwner: Address;
+  targetUsdc: bigint;
+  minUsdc: bigint;
+  duration: bigint;
+  deploymentConfig: DeploymentConfig;
+}
+
+export interface DeployTokenParams {
+  presaleId: bigint;
+}
+
+export interface CreatePresaleResult {
+  presaleId: bigint;
+  transactionHash: Hash;
+  blockNumber: bigint;
+}
+
+export interface DeployTokenResult {
+  tokenAddress: Address;
+  transactionHash: Hash;
+  blockNumber: bigint;
+}
+
 // ============ Event Types ============
 
 export interface PresaleCreatedEvent {
@@ -224,6 +248,7 @@ export interface UsdcClaimedEvent {
 
 export interface KarmaPresaleSDKConfig {
   presaleContractAddress: Address;
+  karmaFactoryAddress: Address;
   usdcAddress: Address;
   chainId: number;
 }

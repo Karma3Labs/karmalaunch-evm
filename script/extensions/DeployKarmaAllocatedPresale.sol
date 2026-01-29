@@ -8,28 +8,47 @@ import {Karma} from "../../contracts/Karma.sol";
 import {KarmaAllocatedPresale} from "../../contracts/extensions/KarmaAllocatedPresale.sol";
 
 /// @title DeployKarmaAllocatedPresale
-/// @notice Deployment script for the KarmaAllocatedPresale extension
-/// @dev Run with: forge script script/extensions/DeployKarmaAllocatedPresale.sol:DeployKarmaAllocatedPresale --rpc-url $RPC_URL --broadcast --verify
+/// @notice Deployment script for the KarmaAllocatedPresale extension on Base
+/// @dev Set NETWORK=mainnet for Base Mainnet, or leave unset/testnet for Base Sepolia
+/// @dev Required env: PRIVATE_KEY, NETWORK
+/// @dev Run with: forge script script/extensions/DeployKarmaAllocatedPresale.sol:DeployKarmaAllocatedPresale --rpc-url $BASE_SEPOLIA_RPC_URL --broadcast --verify
 contract DeployKarmaAllocatedPresale is BaseScript {
-    function run() external {
-        // Load configuration from environment
-        address karmaAddress = vm.envAddress("KARMA_ADDRESS");
-        address usdcAddress = vm.envOr("USDC_ADDRESS", USDC);
-        address karmaFeeRecipient = vm.envOr("KARMA_FEE_RECIPIENT", deployer);
-        bool enableOnKarma = vm.envOr("ENABLE_ON_KARMA", true);
+    // ============ Configuration ============
+    // Set these addresses before running the script
 
+    // TODO: Set the Karma contract address for your deployment
+    address constant KARMA_ADDRESS = address(0);
+
+    // Whether to automatically enable the extension on Karma
+    bool constant ENABLE_ON_KARMA = true;
+
+    function run() external {
+        require(KARMA_ADDRESS != address(0), "KARMA_ADDRESS not set");
+
+        // Use network-specific USDC from BaseScript
+        address usdcAddress = USDC;
+
+        // Fee recipient defaults to deployer
+        address karmaFeeRecipient = deployer;
+
+        console.log("");
         console.log("=== Deploying KarmaAllocatedPresale Extension ===");
-        console.log("Karma address:", karmaAddress);
-        console.log("USDC address:", usdcAddress);
-        console.log("Karma fee recipient:", karmaFeeRecipient);
-        console.log("Enable on Karma:", enableOnKarma);
+        console.log("Network:", isMainnet ? "Base Mainnet" : "Base Sepolia");
+        console.log("Chain ID:", chainId);
+        console.log("");
+        console.log("Configuration:");
+        console.log("  Karma address:", KARMA_ADDRESS);
+        console.log("  USDC address:", usdcAddress);
+        console.log("  Fee recipient:", karmaFeeRecipient);
+        console.log("  Enable on Karma:", ENABLE_ON_KARMA);
+        console.log("");
 
         startBroadcast();
 
         // Deploy KarmaAllocatedPresale
         KarmaAllocatedPresale allocatedPresale = new KarmaAllocatedPresale(
             deployer,           // owner
-            karmaAddress,       // factory
+            KARMA_ADDRESS,      // factory
             usdcAddress,        // usdc
             karmaFeeRecipient   // karma fee recipient
         );
@@ -37,8 +56,8 @@ contract DeployKarmaAllocatedPresale is BaseScript {
         logDeployment("KarmaAllocatedPresale", deployed.karmaAllocatedPresale);
 
         // Optionally enable the extension on Karma
-        if (enableOnKarma) {
-            Karma karma = Karma(karmaAddress);
+        if (ENABLE_ON_KARMA) {
+            Karma karma = Karma(KARMA_ADDRESS);
             karma.setExtension(deployed.karmaAllocatedPresale, true);
             console.log("KarmaAllocatedPresale enabled on Karma");
         }
@@ -46,7 +65,9 @@ contract DeployKarmaAllocatedPresale is BaseScript {
         stopBroadcast();
 
         console.log("");
-        console.log("=== KarmaAllocatedPresale Deployment Complete ===");
+        console.log("=== Deployment Complete ===");
         console.log("KarmaAllocatedPresale:", deployed.karmaAllocatedPresale);
+        console.log("");
+        console.log("Explorer:", getExplorerUrl(deployed.karmaAllocatedPresale));
     }
 }

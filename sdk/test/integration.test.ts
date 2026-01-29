@@ -4,732 +4,977 @@ import {
   createWalletClient,
   http,
   parseUnits,
-  encodeAbiParameters,
+  formatUnits,
   decodeEventLog,
+  encodeAbiParameters,
   type Address,
   type Hash,
   type PublicClient,
   type WalletClient,
 } from "viem";
-import { foundry } from "viem/chains";
+import { baseSepolia } from "viem/chains";
 import { privateKeyToAccount } from "viem/accounts";
+import { readFileSync } from "fs";
+import { join } from "path";
 
 import { KarmaPresaleSDK, PresaleStatus } from "../src/index.js";
 import { KarmaAllocatedPresaleAbi } from "../src/abis/KarmaAllocatedPresale.js";
 import { ERC20Abi } from "../src/abis/ERC20.js";
 
-// Test constants
-const ANVIL_RPC_URL = "http://127.0.0.1:8545";
-const USDC_DECIMALS = 6;
-const TOKEN_DECIMALS = 18;
-
-// Anvil default accounts (deterministic)
-const DEPLOYER_PRIVATE_KEY =
-  "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as const;
-const ALICE_PRIVATE_KEY =
-  "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d" as const;
-const BOB_PRIVATE_KEY =
-  "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a" as const;
-const CHARLIE_PRIVATE_KEY =
-  "0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6" as const;
-const ADMIN_PRIVATE_KEY =
-  "0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a" as const;
-
-// Clients
-let publicClient: PublicClient;
-let deployerWallet: WalletClient;
-let aliceWallet: WalletClient;
-let bobWallet: WalletClient;
-let charlieWallet: WalletClient;
-let adminWallet: WalletClient;
-
-// Accounts
-let deployer: Address;
-let alice: Address;
-let bob: Address;
-let charlie: Address;
-let admin: Address;
-
-// Contract addresses from deployment
-const presaleAddress = (process.env.PRESALE_ADDRESS ||
-  "0x4EE6eCAD1c2Dae9f525404De8555724e3c35d07B") as Address;
-const usdcAddress = (process.env.USDC_ADDRESS ||
-  "0x5FbDB2315678afecb367f032d93F642f64180aa3") as Address;
-const tokenAddress = (process.env.TOKEN_ADDRESS ||
-  "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512") as Address;
-
-// Test presale parameters (reduced to work with available test balances)
-const TARGET_USDC = parseUnits("10000", USDC_DECIMALS);
-const MIN_USDC = parseUnits("5000", USDC_DECIMALS);
-const PRESALE_DURATION = 7n * 24n * 60n * 60n;
-const PRESALE_TOKEN_SUPPLY = parseUnits("50000000000", TOKEN_DECIMALS);
-
-// Mock ABIs with mint function
-const MockERC20Abi = [
-  ...ERC20Abi,
+// Karma Factory ABI (only the deployToken function we need)
+const KarmaAbi = [
   {
     type: "function",
-    name: "mint",
-    stateMutability: "nonpayable",
+    name: "deployToken",
     inputs: [
-      { name: "to", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    outputs: [],
-  },
-] as const;
-
-// Amount of USDC to mint for each test account
-const TEST_USDC_AMOUNT = parseUnits("100000", USDC_DECIMALS);
-
-// ABI for setAdmin function
-const OwnerAdminsAbi = [
-  {
-    type: "function",
-    name: "setAdmin",
-    stateMutability: "nonpayable",
-    inputs: [
-      { name: "admin", type: "address" },
-      { name: "enabled", type: "bool" },
-    ],
-    outputs: [],
-  },
-] as const;
-
-// Helper to mint USDC to test accounts
-async function mintUsdcToTestAccounts(): Promise<void> {
-  const accounts = [alice, bob, charlie];
-  for (const account of accounts) {
-    const hash = await deployerWallet.writeContract({
-      address: usdcAddress,
-      abi: MockERC20Abi,
-      functionName: "mint",
-      args: [account, TEST_USDC_AMOUNT],
-    });
-    await publicClient.waitForTransactionReceipt({ hash });
-  }
-}
-
-// Helper to setup test environment
-async function setupTestEnvironment(): Promise<void> {
-  publicClient = createPublicClient({
-    chain: foundry,
-    transport: http(ANVIL_RPC_URL),
-  });
-
-  const deployerAccount = privateKeyToAccount(DEPLOYER_PRIVATE_KEY);
-  const aliceAccount = privateKeyToAccount(ALICE_PRIVATE_KEY);
-  const bobAccount = privateKeyToAccount(BOB_PRIVATE_KEY);
-  const charlieAccount = privateKeyToAccount(CHARLIE_PRIVATE_KEY);
-  const adminAccount = privateKeyToAccount(ADMIN_PRIVATE_KEY);
-
-  deployer = deployerAccount.address;
-  alice = aliceAccount.address;
-  bob = bobAccount.address;
-  charlie = charlieAccount.address;
-  admin = adminAccount.address;
-
-  deployerWallet = createWalletClient({
-    account: deployerAccount,
-    chain: foundry,
-    transport: http(ANVIL_RPC_URL),
-  });
-
-  aliceWallet = createWalletClient({
-    account: aliceAccount,
-    chain: foundry,
-    transport: http(ANVIL_RPC_URL),
-  });
-
-  bobWallet = createWalletClient({
-    account: bobAccount,
-    chain: foundry,
-    transport: http(ANVIL_RPC_URL),
-  });
-
-  charlieWallet = createWalletClient({
-    account: charlieAccount,
-    chain: foundry,
-    transport: http(ANVIL_RPC_URL),
-  });
-
-  adminWallet = createWalletClient({
-    account: adminAccount,
-    chain: foundry,
-    transport: http(ANVIL_RPC_URL),
-  });
-}
-
-// Helper to advance time on anvil
-async function advanceTime(seconds: bigint): Promise<void> {
-  await fetch(ANVIL_RPC_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "evm_increaseTime",
-      params: [Number(seconds)],
-      id: 1,
-    }),
-  });
-
-  await fetch(ANVIL_RPC_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "evm_mine",
-      params: [],
-      id: 1,
-    }),
-  });
-}
-
-// Helper to create a presale
-async function createPresale(): Promise<bigint> {
-  const deploymentConfig = {
-    tokenConfig: {
-      tokenAdmin: deployer,
-      name: "Test Token",
-      symbol: "TEST",
-      salt: "0x0000000000000000000000000000000000000000000000000000000000000000" as Hash,
-      image: "https://example.com/image.png",
-      metadata: "Test metadata",
-      context: "Test context",
-      originatingChainId: BigInt(foundry.id),
-    },
-    poolConfig: {
-      hook: "0x0000000000000000000000000000000000000000" as Address,
-      pairedToken: usdcAddress,
-      tickIfToken0IsKarma: 0,
-      tickSpacing: 60,
-      poolData: "0x" as `0x${string}`,
-    },
-    lockerConfig: {
-      locker: "0x0000000000000000000000000000000000000000" as Address,
-      rewardAdmins: [],
-      rewardRecipients: [],
-      rewardBps: [],
-      tickLower: [],
-      tickUpper: [],
-      positionBps: [],
-      lockerData: "0x" as `0x${string}`,
-    },
-    mevModuleConfig: {
-      mevModule: "0x0000000000000000000000000000000000000000" as Address,
-      mevModuleData: "0x" as `0x${string}`,
-    },
-    extensionConfigs: [
       {
-        extension: presaleAddress,
-        msgValue: 0n,
-        extensionBps: 5000,
-        extensionData: "0x" as `0x${string}`,
+        name: "deploymentConfig",
+        type: "tuple",
+        internalType: "struct IKarma.DeploymentConfig",
+        components: [
+          {
+            name: "tokenConfig",
+            type: "tuple",
+            internalType: "struct IKarma.TokenConfig",
+            components: [
+              { name: "tokenAdmin", type: "address", internalType: "address" },
+              { name: "name", type: "string", internalType: "string" },
+              { name: "symbol", type: "string", internalType: "string" },
+              { name: "salt", type: "bytes32", internalType: "bytes32" },
+              { name: "image", type: "string", internalType: "string" },
+              { name: "metadata", type: "string", internalType: "string" },
+              { name: "context", type: "string", internalType: "string" },
+              {
+                name: "originatingChainId",
+                type: "uint256",
+                internalType: "uint256",
+              },
+            ],
+          },
+          {
+            name: "poolConfig",
+            type: "tuple",
+            internalType: "struct IKarma.PoolConfig",
+            components: [
+              { name: "hook", type: "address", internalType: "address" },
+              { name: "pairedToken", type: "address", internalType: "address" },
+              {
+                name: "tickIfToken0IsKarma",
+                type: "int24",
+                internalType: "int24",
+              },
+              { name: "tickSpacing", type: "int24", internalType: "int24" },
+              { name: "poolData", type: "bytes", internalType: "bytes" },
+            ],
+          },
+          {
+            name: "lockerConfig",
+            type: "tuple",
+            internalType: "struct IKarma.LockerConfig",
+            components: [
+              { name: "locker", type: "address", internalType: "address" },
+              {
+                name: "rewardAdmins",
+                type: "address[]",
+                internalType: "address[]",
+              },
+              {
+                name: "rewardRecipients",
+                type: "address[]",
+                internalType: "address[]",
+              },
+              { name: "rewardBps", type: "uint16[]", internalType: "uint16[]" },
+              { name: "tickLower", type: "int24[]", internalType: "int24[]" },
+              { name: "tickUpper", type: "int24[]", internalType: "int24[]" },
+              {
+                name: "positionBps",
+                type: "uint16[]",
+                internalType: "uint16[]",
+              },
+              { name: "lockerData", type: "bytes", internalType: "bytes" },
+            ],
+          },
+          {
+            name: "mevModuleConfig",
+            type: "tuple",
+            internalType: "struct IKarma.MevModuleConfig",
+            components: [
+              { name: "mevModule", type: "address", internalType: "address" },
+              { name: "mevModuleData", type: "bytes", internalType: "bytes" },
+            ],
+          },
+          {
+            name: "extensionConfigs",
+            type: "tuple[]",
+            internalType: "struct IKarma.ExtensionConfig[]",
+            components: [
+              { name: "extension", type: "address", internalType: "address" },
+              { name: "msgValue", type: "uint256", internalType: "uint256" },
+              { name: "extensionBps", type: "uint16", internalType: "uint16" },
+              { name: "extensionData", type: "bytes", internalType: "bytes" },
+            ],
+          },
+        ],
       },
     ],
-  };
+    outputs: [
+      { name: "tokenAddress", type: "address", internalType: "address" },
+    ],
+    stateMutability: "payable",
+  },
+  {
+    type: "event",
+    name: "TokenCreated",
+    inputs: [
+      {
+        name: "msgSender",
+        type: "address",
+        indexed: false,
+        internalType: "address",
+      },
+      {
+        name: "tokenAddress",
+        type: "address",
+        indexed: true,
+        internalType: "address",
+      },
+      {
+        name: "tokenAdmin",
+        type: "address",
+        indexed: true,
+        internalType: "address",
+      },
+      {
+        name: "tokenImage",
+        type: "string",
+        indexed: false,
+        internalType: "string",
+      },
+      {
+        name: "tokenName",
+        type: "string",
+        indexed: false,
+        internalType: "string",
+      },
+      {
+        name: "tokenSymbol",
+        type: "string",
+        indexed: false,
+        internalType: "string",
+      },
+      {
+        name: "tokenMetadata",
+        type: "string",
+        indexed: false,
+        internalType: "string",
+      },
+      {
+        name: "tokenContext",
+        type: "string",
+        indexed: false,
+        internalType: "string",
+      },
+      {
+        name: "startingTick",
+        type: "int24",
+        indexed: false,
+        internalType: "int24",
+      },
+      {
+        name: "poolHook",
+        type: "address",
+        indexed: false,
+        internalType: "address",
+      },
+      {
+        name: "poolId",
+        type: "bytes32",
+        indexed: false,
+        internalType: "PoolId",
+      },
+      {
+        name: "pairedToken",
+        type: "address",
+        indexed: false,
+        internalType: "address",
+      },
+      {
+        name: "locker",
+        type: "address",
+        indexed: false,
+        internalType: "address",
+      },
+      {
+        name: "mevModule",
+        type: "address",
+        indexed: false,
+        internalType: "address",
+      },
+      {
+        name: "extensionsSupply",
+        type: "uint256",
+        indexed: false,
+        internalType: "uint256",
+      },
+      {
+        name: "extensions",
+        type: "address[]",
+        indexed: false,
+        internalType: "address[]",
+      },
+    ],
+    anonymous: false,
+  },
+] as const;
 
-  const hash = await adminWallet.writeContract({
-    address: presaleAddress,
-    abi: KarmaAllocatedPresaleAbi,
-    functionName: "createPresale",
-    args: [deployer, TARGET_USDC, MIN_USDC, PRESALE_DURATION, deploymentConfig],
+// ============ Load Deployment Data ============
+
+interface DeploymentData {
+  chainId: number;
+  isMainnet: boolean;
+  // Core
+  karma: Address;
+  karmaFeeLocker: Address;
+  // Hooks
+  karmaHookStaticFeeV2: Address;
+  karmaPoolExtensionAllowlist: Address;
+  // LP Lockers
+  karmaLpLockerMultiple: Address;
+  // MEV Modules
+  karmaMevModulePassthrough: Address;
+  // Extensions
+  karmaAllocatedPresale: Address;
+  // External
+  usdc: Address;
+  weth: Address;
+  poolManager: Address;
+  positionManager: Address;
+  permit2: Address;
+}
+
+function loadDeploymentData(): DeploymentData {
+  const deploymentPath = join(
+    __dirname,
+    "../../deployments/karma-base-sepolia.json",
+  );
+  const data = JSON.parse(readFileSync(deploymentPath, "utf-8"));
+  return data as DeploymentData;
+}
+
+const deployment = loadDeploymentData();
+
+// ============ Network Configuration ============
+
+const BASE_SEPOLIA_CONFIG = {
+  name: "Base Sepolia Testnet",
+  chain: baseSepolia,
+  rpcUrl: process.env.BASE_SEPOLIA_RPC_URL || "https://sepolia.base.org",
+  // Core
+  karmaFactory: deployment.karma,
+  karmaFeeLocker: deployment.karmaFeeLocker,
+  // Hooks
+  karmaHookStaticFeeV2: deployment.karmaHookStaticFeeV2,
+  karmaPoolExtensionAllowlist: deployment.karmaPoolExtensionAllowlist,
+  // LP Lockers
+  karmaLpLockerMultiple: deployment.karmaLpLockerMultiple,
+  // MEV Modules
+  karmaMevModulePassthrough: deployment.karmaMevModulePassthrough,
+  // Extensions
+  presaleAddress: deployment.karmaAllocatedPresale,
+  // External
+  usdcAddress: deployment.usdc,
+  wethAddress: deployment.weth,
+  poolManager: deployment.poolManager,
+  positionManager: deployment.positionManager,
+  permit2: deployment.permit2,
+};
+
+// ============ Test Constants ============
+
+const USDC_DECIMALS = 6;
+
+// Presale parameters - configurable via env vars
+const PRESALE_DURATION_SECONDS = Number(process.env.PRESALE_DURATION || "120"); // 2 minutes default
+const TARGET_USDC = parseUnits(
+  process.env.TARGET_USDC || "1000",
+  USDC_DECIMALS,
+);
+const MIN_USDC = parseUnits(process.env.MIN_USDC || "500", USDC_DECIMALS);
+
+// Contribution amounts (total 1500 USDC to ensure oversubscription)
+const CONTRIBUTION_AMOUNT_1 = parseUnits("400", USDC_DECIMALS); // PRIVATE_KEY account
+const CONTRIBUTION_AMOUNT_2 = parseUnits("350", USDC_DECIMALS); // TEST_KEY_1
+const CONTRIBUTION_AMOUNT_3 = parseUnits("300", USDC_DECIMALS); // TEST_KEY_2
+const CONTRIBUTION_AMOUNT_4 = parseUnits("250", USDC_DECIMALS); // TEST_KEY_3
+const CONTRIBUTION_AMOUNT_5 = parseUnits("200", USDC_DECIMALS); // TEST_KEY_4
+
+// Allocation amounts (total 1000 USDC - matching target)
+const ALLOCATION_AMOUNT_1 = parseUnits("300", USDC_DECIMALS);
+const ALLOCATION_AMOUNT_2 = parseUnits("250", USDC_DECIMALS);
+const ALLOCATION_AMOUNT_3 = parseUnits("200", USDC_DECIMALS);
+const ALLOCATION_AMOUNT_4 = parseUnits("150", USDC_DECIMALS);
+const ALLOCATION_AMOUNT_5 = parseUnits("100", USDC_DECIMALS);
+
+// ============ Global State ============
+
+let publicClient: PublicClient;
+
+// Wallet clients for each test account
+let deployerWallet: WalletClient;
+let wallet1: WalletClient;
+let wallet2: WalletClient;
+let wallet3: WalletClient;
+let wallet4: WalletClient;
+
+// Addresses derived from private keys
+let deployerAddress: Address;
+let address1: Address;
+let address2: Address;
+let address3: Address;
+let address4: Address;
+
+// ============ Helper Functions ============
+
+function getRequiredEnvVar(name: string): `0x${string}` {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} environment variable is required`);
+  }
+  return value as `0x${string}`;
+}
+
+async function setupTestEnvironment(): Promise<void> {
+  console.log(`\n📋 Deployment Data Loaded:`);
+  console.log(`   Chain ID: ${deployment.chainId}`);
+  console.log(`   Is Mainnet: ${deployment.isMainnet}`);
+  console.log(`   Karma Factory: ${deployment.karma}`);
+  console.log(`   KarmaAllocatedPresale: ${deployment.karmaAllocatedPresale}`);
+  console.log(`   KarmaFeeLocker: ${deployment.karmaFeeLocker}`);
+  console.log(`   USDC (FakeUSDC): ${deployment.usdc}`);
+
+  console.log(`\n📋 Network Configuration:`);
+  console.log(`   Network: ${BASE_SEPOLIA_CONFIG.name}`);
+  console.log(`   Chain ID: ${BASE_SEPOLIA_CONFIG.chain.id}`);
+  console.log(`   RPC URL: ${BASE_SEPOLIA_CONFIG.rpcUrl}`);
+
+  publicClient = createPublicClient({
+    chain: BASE_SEPOLIA_CONFIG.chain,
+    transport: http(BASE_SEPOLIA_CONFIG.rpcUrl),
   });
 
+  // Load private keys from environment
+  const deployerKey = getRequiredEnvVar("PRIVATE_KEY");
+  const testKey1 = getRequiredEnvVar("TEST_KEY_1");
+  const testKey2 = getRequiredEnvVar("TEST_KEY_2");
+  const testKey3 = getRequiredEnvVar("TEST_KEY_3");
+  const testKey4 = getRequiredEnvVar("TEST_KEY_4");
+
+  // Create accounts from private keys
+  const deployerAccount = privateKeyToAccount(deployerKey);
+  const account1 = privateKeyToAccount(testKey1);
+  const account2 = privateKeyToAccount(testKey2);
+  const account3 = privateKeyToAccount(testKey3);
+  const account4 = privateKeyToAccount(testKey4);
+
+  // Store addresses
+  deployerAddress = deployerAccount.address;
+  address1 = account1.address;
+  address2 = account2.address;
+  address3 = account3.address;
+  address4 = account4.address;
+
+  // Create wallet clients
+  deployerWallet = createWalletClient({
+    account: deployerAccount,
+    chain: BASE_SEPOLIA_CONFIG.chain,
+    transport: http(BASE_SEPOLIA_CONFIG.rpcUrl),
+  });
+
+  wallet1 = createWalletClient({
+    account: account1,
+    chain: BASE_SEPOLIA_CONFIG.chain,
+    transport: http(BASE_SEPOLIA_CONFIG.rpcUrl),
+  });
+
+  wallet2 = createWalletClient({
+    account: account2,
+    chain: BASE_SEPOLIA_CONFIG.chain,
+    transport: http(BASE_SEPOLIA_CONFIG.rpcUrl),
+  });
+
+  wallet3 = createWalletClient({
+    account: account3,
+    chain: BASE_SEPOLIA_CONFIG.chain,
+    transport: http(BASE_SEPOLIA_CONFIG.rpcUrl),
+  });
+
+  wallet4 = createWalletClient({
+    account: account4,
+    chain: BASE_SEPOLIA_CONFIG.chain,
+    transport: http(BASE_SEPOLIA_CONFIG.rpcUrl),
+  });
+
+  console.log(`\n👥 Test Accounts:`);
+  console.log(`   Deployer (PRIVATE_KEY): ${deployerAddress}`);
+  console.log(`   Account 1 (TEST_KEY_1): ${address1}`);
+  console.log(`   Account 2 (TEST_KEY_2): ${address2}`);
+  console.log(`   Account 3 (TEST_KEY_3): ${address3}`);
+  console.log(`   Account 4 (TEST_KEY_4): ${address4}`);
+}
+
+async function approveUsdcForPresale(
+  wallet: WalletClient,
+  amount: bigint,
+): Promise<void> {
+  const account = wallet.account!;
+  const hash = await wallet.writeContract({
+    address: BASE_SEPOLIA_CONFIG.usdcAddress,
+    abi: ERC20Abi,
+    functionName: "approve",
+    args: [BASE_SEPOLIA_CONFIG.presaleAddress, amount],
+    chain: BASE_SEPOLIA_CONFIG.chain,
+    account,
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+}
+
+async function contributeToPresale(
+  wallet: WalletClient,
+  presaleId: bigint,
+  amount: bigint,
+): Promise<void> {
+  const account = wallet.account!;
+  const hash = await wallet.writeContract({
+    address: BASE_SEPOLIA_CONFIG.presaleAddress,
+    abi: KarmaAllocatedPresaleAbi,
+    functionName: "contribute",
+    args: [presaleId, amount],
+    chain: BASE_SEPOLIA_CONFIG.chain,
+    account,
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+}
+
+async function claimFromPresale(
+  wallet: WalletClient,
+  presaleId: bigint,
+): Promise<{ tokenAmount: bigint; refundAmount: bigint }> {
+  const account = wallet.account!;
+  const hash = await wallet.writeContract({
+    address: BASE_SEPOLIA_CONFIG.presaleAddress,
+    abi: KarmaAllocatedPresaleAbi,
+    functionName: "claim",
+    args: [presaleId],
+    chain: BASE_SEPOLIA_CONFIG.chain,
+    account,
+  });
   const receipt = await publicClient.waitForTransactionReceipt({ hash });
 
-  // Get presale ID from the PresaleCreated event
-  const presaleCreatedLog = receipt.logs.find((log) => {
+  // Parse events to get amounts
+  let tokenAmount = 0n;
+  let refundAmount = 0n;
+
+  for (const log of receipt.logs) {
     try {
       const decoded = decodeEventLog({
         abi: KarmaAllocatedPresaleAbi,
         data: log.data,
         topics: log.topics,
       });
-      return decoded.eventName === "PresaleCreated";
+      if (decoded.eventName === "TokensClaimed") {
+        tokenAmount = (decoded.args as { tokenAmount: bigint }).tokenAmount;
+      }
+      if (decoded.eventName === "RefundClaimed") {
+        refundAmount = (decoded.args as { refundAmount: bigint }).refundAmount;
+      }
     } catch {
-      return false;
+      // Not a matching event
     }
-  });
-
-  if (!presaleCreatedLog) {
-    throw new Error("PresaleCreated event not found in transaction receipt");
   }
 
-  const decoded = decodeEventLog({
-    abi: KarmaAllocatedPresaleAbi,
-    data: presaleCreatedLog.data,
-    topics: presaleCreatedLog.topics,
-  });
-
-  return (decoded.args as { presaleId: bigint }).presaleId;
+  return { tokenAmount, refundAmount };
 }
 
-// Helper to set max accepted USDC for users
-async function setMaxAcceptedUsdcForUsers(
-  presaleId: bigint,
-  allocations: { user: Address; maxUsdc: bigint }[],
-): Promise<void> {
-  for (const { user, maxUsdc } of allocations) {
-    const hash = await adminWallet.writeContract({
-      address: presaleAddress,
-      abi: KarmaAllocatedPresaleAbi,
-      functionName: "setMaxAcceptedUsdc",
-      args: [presaleId, user, maxUsdc],
-    });
-    await publicClient.waitForTransactionReceipt({ hash });
+async function waitForPresaleEnd(endTime: bigint): Promise<void> {
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  const waitTime = Number(endTime - now);
+
+  if (waitTime > 0) {
+    console.log(`   ⏳ Waiting ${waitTime} seconds for presale to end...`);
+    await new Promise((resolve) => setTimeout(resolve, (waitTime + 5) * 1000)); // Add 5 seconds buffer
   }
 }
 
-// Helper to complete deployment (simulates factory behavior)
-async function completeDeployment(presaleId: bigint): Promise<void> {
-  // First prepare for deployment
-  const prepareHash = await deployerWallet.writeContract({
-    address: presaleAddress,
-    abi: KarmaAllocatedPresaleAbi,
-    functionName: "prepareForDeployment",
-    args: [
-      presaleId,
-      "0x0000000000000000000000000000000000000000000000000000000000000001" as Hash,
-    ],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: prepareHash });
+function formatUsdc(amount: bigint): string {
+  return formatUnits(amount, USDC_DECIMALS);
+}
 
-  // Mint tokens to deployer (who acts as factory)
-  const mintHash = await deployerWallet.writeContract({
-    address: tokenAddress,
-    abi: MockERC20Abi,
-    functionName: "mint",
-    args: [deployer, PRESALE_TOKEN_SUPPLY],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: mintHash });
+// ============ Test Suite ============
 
-  // Encode the presale ID as extensionData
-  const extensionData = encodeAbiParameters([{ type: "uint256" }], [presaleId]);
+describe("Presale Full Flow Integration Test (Base Sepolia)", () => {
+  let sdk: KarmaPresaleSDK;
+  let presaleId: bigint;
 
-  const poolKey = {
-    currency0: "0x0000000000000000000000000000000000000000" as Address,
-    currency1: tokenAddress,
-    fee: 0,
-    tickSpacing: 60,
-    hooks: "0x0000000000000000000000000000000000000000" as Address,
-  };
+  beforeAll(async () => {
+    await setupTestEnvironment();
 
-  const deploymentConfig = {
-    tokenConfig: {
-      tokenAdmin: deployer,
-      name: "Test Token",
-      symbol: "TEST",
-      salt: "0x0000000000000000000000000000000000000000000000000000000000000001" as Hash,
-      image: "https://example.com/image.png",
-      metadata: "Test metadata",
-      context: "Test context",
-      originatingChainId: BigInt(foundry.id),
-    },
-    poolConfig: {
-      hook: "0x0000000000000000000000000000000000000000" as Address,
-      pairedToken: usdcAddress,
-      tickIfToken0IsKarma: 0,
-      tickSpacing: 60,
-      poolData: "0x" as `0x${string}`,
-    },
-    lockerConfig: {
-      locker: "0x0000000000000000000000000000000000000000" as Address,
-      rewardAdmins: [] as Address[],
-      rewardRecipients: [] as Address[],
-      rewardBps: [] as number[],
-      tickLower: [] as number[],
-      tickUpper: [] as number[],
-      positionBps: [] as number[],
-      lockerData: "0x" as `0x${string}`,
-    },
-    mevModuleConfig: {
-      mevModule: "0x0000000000000000000000000000000000000000" as Address,
-      mevModuleData: "0x" as `0x${string}`,
-    },
-    extensionConfigs: [
-      {
-        extension: presaleAddress,
-        msgValue: 0n,
-        extensionBps: 5000,
-        extensionData: extensionData,
+    const config = {
+      presaleContractAddress: BASE_SEPOLIA_CONFIG.presaleAddress,
+      karmaFactoryAddress: BASE_SEPOLIA_CONFIG.karmaFactory,
+      usdcAddress: BASE_SEPOLIA_CONFIG.usdcAddress,
+      chainId: BASE_SEPOLIA_CONFIG.chain.id,
+    };
+
+    sdk = new KarmaPresaleSDK(config, publicClient, deployerWallet);
+  }, 60000);
+
+  it("should complete full presale flow", async () => {
+    console.log("\n🚀 Starting Full Presale Flow Integration Test\n");
+
+    // ============ Step 1: Check initial balances ============
+    console.log("📊 Step 1: Checking initial fUSDC balances...");
+
+    const balances = await Promise.all([
+      sdk.getUsdcBalance(deployerAddress),
+      sdk.getUsdcBalance(address1),
+      sdk.getUsdcBalance(address2),
+      sdk.getUsdcBalance(address3),
+      sdk.getUsdcBalance(address4),
+    ]);
+
+    console.log(`   Deployer: ${formatUsdc(balances[0])} fUSDC`);
+    console.log(`   Account 1: ${formatUsdc(balances[1])} fUSDC`);
+    console.log(`   Account 2: ${formatUsdc(balances[2])} fUSDC`);
+    console.log(`   Account 3: ${formatUsdc(balances[3])} fUSDC`);
+    console.log(`   Account 4: ${formatUsdc(balances[4])} fUSDC`);
+
+    // Verify all accounts have enough balance
+    expect(balances[0]).toBeGreaterThanOrEqual(CONTRIBUTION_AMOUNT_1);
+    expect(balances[1]).toBeGreaterThanOrEqual(CONTRIBUTION_AMOUNT_2);
+    expect(balances[2]).toBeGreaterThanOrEqual(CONTRIBUTION_AMOUNT_3);
+    expect(balances[3]).toBeGreaterThanOrEqual(CONTRIBUTION_AMOUNT_4);
+    expect(balances[4]).toBeGreaterThanOrEqual(CONTRIBUTION_AMOUNT_5);
+    console.log("   ✅ All accounts have sufficient fUSDC balance\n");
+
+    // ============ Step 2: Create presale ============
+    console.log("📝 Step 2: Creating presale...");
+    console.log(`   Duration: ${PRESALE_DURATION_SECONDS} seconds`);
+    console.log(`   Target USDC: ${formatUsdc(TARGET_USDC)}`);
+    console.log(`   Min USDC: ${formatUsdc(MIN_USDC)}`);
+
+    // Encode pool config data for KarmaHookStaticFeeV2
+    // The poolData must be encoded as PoolInitializationData struct:
+    // struct PoolInitializationData {
+    //     address extension;
+    //     bytes extensionData;
+    //     bytes feeData;
+    // }
+    // Where feeData is encoded as PoolStaticConfigVars { uint24 karmaFee, uint24 pairedFee }
+
+    // First encode the fee data (PoolStaticConfigVars struct)
+    const feeData = encodeAbiParameters(
+      [
+        {
+          type: "tuple",
+          components: [
+            { name: "karmaFee", type: "uint24" },
+            { name: "pairedFee", type: "uint24" },
+          ],
+        },
+      ],
+      [{ karmaFee: 10000, pairedFee: 10000 }], // 1% fees
+    );
+
+    // Then encode the full PoolInitializationData struct
+    const poolData = encodeAbiParameters(
+      [
+        {
+          type: "tuple",
+          components: [
+            { name: "extension", type: "address" },
+            { name: "extensionData", type: "bytes" },
+            { name: "feeData", type: "bytes" },
+          ],
+        },
+      ],
+      [
+        {
+          extension: "0x0000000000000000000000000000000000000000" as Address,
+          extensionData: "0x" as `0x${string}`,
+          feeData: feeData,
+        },
+      ],
+    );
+
+    const deploymentConfig = {
+      tokenConfig: {
+        tokenAdmin: deployerAddress,
+        name: "Integration Test Token",
+        symbol: "ITT",
+        salt: "0x0000000000000000000000000000000000000000000000000000000000000000" as Hash,
+        image: "https://example.com/token.png",
+        metadata: "Integration test token metadata",
+        context: "Created by SDK integration test",
+        originatingChainId: BigInt(BASE_SEPOLIA_CONFIG.chain.id),
       },
-    ],
-  };
+      poolConfig: {
+        hook: BASE_SEPOLIA_CONFIG.karmaHookStaticFeeV2,
+        pairedToken: BASE_SEPOLIA_CONFIG.usdcAddress,
+        tickIfToken0IsKarma: 0,
+        tickSpacing: 60,
+        poolData: poolData,
+      },
+      lockerConfig: {
+        locker: BASE_SEPOLIA_CONFIG.karmaLpLockerMultiple,
+        rewardAdmins: [deployerAddress] as Address[],
+        rewardRecipients: [deployerAddress] as Address[],
+        rewardBps: [10000] as number[], // 100% to deployer
+        tickLower: [0] as number[], // Must be >= tickIfToken0IsKarma (which is 0)
+        tickUpper: [887220] as number[], // Near max tick, divisible by 60
+        positionBps: [10000] as number[], // 100% in one position
+        lockerData: "0x" as `0x${string}`,
+      },
+      mevModuleConfig: {
+        mevModule: BASE_SEPOLIA_CONFIG.karmaMevModulePassthrough,
+        mevModuleData: "0x" as `0x${string}`,
+      },
+      extensionConfigs: [
+        {
+          extension: BASE_SEPOLIA_CONFIG.presaleAddress,
+          msgValue: 0n,
+          extensionBps: 5000, // 50% of tokens to presale
+          extensionData: "0x" as `0x${string}`,
+        },
+      ],
+    };
 
-  // Approve presale to take tokens from deployer (factory)
-  const approveHash = await deployerWallet.writeContract({
-    address: tokenAddress,
-    abi: ERC20Abi,
-    functionName: "approve",
-    args: [presaleAddress, PRESALE_TOKEN_SUPPLY],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: approveHash });
-
-  // Call receiveTokens as the factory (deployer)
-  const receiveHash = await deployerWallet.writeContract({
-    address: presaleAddress,
-    abi: KarmaAllocatedPresaleAbi,
-    functionName: "receiveTokens",
-    args: [deploymentConfig, poolKey, tokenAddress, PRESALE_TOKEN_SUPPLY, 0n],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: receiveHash });
-}
-
-describe.skipIf(!process.env.INTEGRATION)(
-  "Full Presale Flow Integration Test",
-  () => {
-    let aliceSDK: KarmaPresaleSDK;
-    let bobSDK: KarmaPresaleSDK;
-    let charlieSDK: KarmaPresaleSDK;
-    let presaleId: bigint;
-
-    beforeAll(async () => {
-      await setupTestEnvironment();
-
-      // Authorize admin account on the presale contract (deployer is owner)
-      console.log("🔑 Authorizing admin account...");
-      const setAdminHash = await deployerWallet.writeContract({
-        address: presaleAddress,
-        abi: OwnerAdminsAbi,
-        functionName: "setAdmin",
-        args: [admin, true],
-      });
-      await publicClient.waitForTransactionReceipt({ hash: setAdminHash });
-      console.log("   ✅ Admin account authorized");
-
-      // Mint USDC to test accounts to ensure sufficient balance
-      console.log("🏦 Minting USDC to test accounts...");
-      await mintUsdcToTestAccounts();
-      console.log("   ✅ USDC minted to Alice, Bob, and Charlie");
-
-      const config = {
-        presaleContractAddress: presaleAddress,
-        usdcAddress: usdcAddress,
-        chainId: foundry.id,
-      };
-
-      aliceSDK = new KarmaPresaleSDK(config, publicClient, aliceWallet);
-      bobSDK = new KarmaPresaleSDK(config, publicClient, bobWallet);
-      charlieSDK = new KarmaPresaleSDK(config, publicClient, charlieWallet);
-
-      // Create presale once for the full flow test
-      presaleId = await createPresale();
+    const createResult = await sdk.createPresale({
+      presaleOwner: deployerAddress,
+      targetUsdc: TARGET_USDC,
+      minUsdc: MIN_USDC,
+      duration: BigInt(PRESALE_DURATION_SECONDS),
+      deploymentConfig,
     });
 
-    it("should complete full presale flow: create -> contribute -> withdraw -> allocate -> claim tokens -> claim refund", async () => {
-      console.log("\n🚀 Starting Full Presale Flow Integration Test\n");
+    presaleId = createResult.presaleId;
+    console.log(`   ✅ Presale created with ID: ${presaleId}`);
 
-      // ============================================
-      // Step 1: Verify presale was created correctly
-      // ============================================
-      console.log("📋 Step 1: Verifying presale creation...");
-      const presaleInfo = await aliceSDK.getPresaleInfo(presaleId);
-      expect(presaleInfo.presaleId).toBe(presaleId);
-      expect(presaleInfo.presale.status).toBe(PresaleStatus.Active);
-      expect(presaleInfo.presale.targetUsdc).toBe(TARGET_USDC);
-      expect(presaleInfo.presale.minUsdc).toBe(MIN_USDC);
-      // Token supply is not known until deployment - only totalAcceptedUsdc matters
-      console.log(`   ✅ Presale #${presaleId} created successfully`);
-      console.log(`   - Target USDC: ${aliceSDK.formatUsdc(TARGET_USDC)}`);
-      console.log(`   - Min USDC: ${aliceSDK.formatUsdc(MIN_USDC)}`);
+    // Wait for RPC to sync after presale creation
+    console.log("   ⏳ Waiting for RPC sync...");
+    await new Promise((resolve) => setTimeout(resolve, 5000));
 
-      // ============================================
-      // Step 2: Users approve and contribute USDC
-      // ============================================
-      console.log("\n💰 Step 2: Users contributing USDC...");
-      await (await aliceSDK.approveMaxUsdc()).wait();
-      await (await bobSDK.approveMaxUsdc()).wait();
-      await (await charlieSDK.approveMaxUsdc()).wait();
+    // ============ Step 3: Approve USDC for all accounts ============
+    console.log("💳 Step 3: Approving fUSDC for presale contributions...");
 
-      const aliceContribution = parseUnits("5000", USDC_DECIMALS);
-      const bobContribution = parseUnits("3000", USDC_DECIMALS);
-      const charlieContribution = parseUnits("2500", USDC_DECIMALS);
+    await Promise.all([
+      approveUsdcForPresale(deployerWallet, CONTRIBUTION_AMOUNT_1),
+      approveUsdcForPresale(wallet1, CONTRIBUTION_AMOUNT_2),
+      approveUsdcForPresale(wallet2, CONTRIBUTION_AMOUNT_3),
+      approveUsdcForPresale(wallet3, CONTRIBUTION_AMOUNT_4),
+      approveUsdcForPresale(wallet4, CONTRIBUTION_AMOUNT_5),
+    ]);
 
-      // Alice contributes
-      console.log(
-        `   - Alice contributing ${aliceSDK.formatUsdc(aliceContribution)} USDC...`,
-      );
-      const aliceContributeResult = await aliceSDK.contribute({
-        presaleId,
-        amount: aliceContribution,
-      });
-      const aliceReceipt = await aliceContributeResult.wait();
-      expect(aliceReceipt.status).toBe("success");
-      console.log("   ✅ Alice contribution successful");
+    console.log("   ✅ All accounts approved fUSDC");
 
-      // Bob contributes with automatic approval method
-      console.log(
-        `   - Bob contributing ${bobSDK.formatUsdc(bobContribution)} USDC (with auto-approval)...`,
-      );
-      const bobContributeResult = await bobSDK.contributeWithApproval({
-        presaleId,
-        amount: bobContribution,
-      });
-      const bobReceipt = await bobContributeResult.wait();
-      expect(bobReceipt.status).toBe("success");
-      console.log("   ✅ Bob contribution successful");
+    // Wait for RPC to sync after approvals
+    console.log("   ⏳ Waiting for RPC sync...");
+    await new Promise((resolve) => setTimeout(resolve, 3000));
 
-      // Charlie contributes
-      console.log(
-        `   - Charlie contributing ${charlieSDK.formatUsdc(charlieContribution)} USDC...`,
-      );
-      await (
-        await charlieSDK.contribute({ presaleId, amount: charlieContribution })
-      ).wait();
-      console.log("   ✅ Charlie contribution successful");
+    // ============ Step 4: Contribute from all accounts ============
+    console.log("💰 Step 4: Contributing fUSDC from all accounts...");
 
-      // Verify contributions
-      const aliceContributionVerify = await aliceSDK.getContribution(
-        presaleId,
-        alice,
-      );
-      expect(aliceContributionVerify).toBe(aliceContribution);
+    await contributeToPresale(deployerWallet, presaleId, CONTRIBUTION_AMOUNT_1);
+    console.log(
+      `   Deployer contributed ${formatUsdc(CONTRIBUTION_AMOUNT_1)} fUSDC`,
+    );
 
-      const bobContributionVerify = await bobSDK.getContribution(
-        presaleId,
-        bob,
-      );
-      expect(bobContributionVerify).toBe(bobContribution);
+    await contributeToPresale(wallet1, presaleId, CONTRIBUTION_AMOUNT_2);
+    console.log(
+      `   Account 1 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_2)} fUSDC`,
+    );
 
-      const presaleAfterContributions = await aliceSDK.getPresale(presaleId);
-      expect(presaleAfterContributions.totalContributions).toBe(
-        aliceContribution + bobContribution + charlieContribution,
-      );
-      console.log(
-        `   📊 Total contributions: ${aliceSDK.formatUsdc(presaleAfterContributions.totalContributions)} USDC`,
-      );
+    await contributeToPresale(wallet2, presaleId, CONTRIBUTION_AMOUNT_3);
+    console.log(
+      `   Account 2 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_3)} fUSDC`,
+    );
 
-      // ============================================
-      // Step 3: Test withdrawal during active presale
-      // ============================================
-      console.log("\n🔙 Step 3: Testing withdrawal during active presale...");
-      const withdrawAmount = parseUnits("500", USDC_DECIMALS);
-      const aliceBalanceBefore = await aliceSDK.getUsdcBalance(alice);
+    await contributeToPresale(wallet3, presaleId, CONTRIBUTION_AMOUNT_4);
+    console.log(
+      `   Account 3 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_4)} fUSDC`,
+    );
 
-      console.log(
-        `   - Alice withdrawing ${aliceSDK.formatUsdc(withdrawAmount)} USDC...`,
-      );
-      const withdrawResult = await aliceSDK.withdrawContribution({
-        presaleId,
-        amount: withdrawAmount,
-      });
-      await withdrawResult.wait();
+    await contributeToPresale(wallet4, presaleId, CONTRIBUTION_AMOUNT_5);
+    console.log(
+      `   Account 4 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_5)} fUSDC`,
+    );
 
-      const aliceBalanceAfter = await aliceSDK.getUsdcBalance(alice);
-      expect(aliceBalanceAfter - aliceBalanceBefore).toBe(withdrawAmount);
-      console.log("   ✅ Withdrawal successful");
+    // Wait for RPC to sync before reading total
+    console.log("   ⏳ Waiting for RPC sync...");
+    await new Promise((resolve) => setTimeout(resolve, 3000));
 
-      const aliceRemainingContribution = await aliceSDK.getContribution(
-        presaleId,
-        alice,
-      );
-      expect(aliceRemainingContribution).toBe(
-        aliceContribution - withdrawAmount,
-      );
+    // Verify total contributions
+    const presaleAfterContributions = await sdk.getPresale(presaleId);
+    const totalContributions = presaleAfterContributions.totalContributions;
+    console.log(
+      `   📊 Total contributions: ${formatUsdc(totalContributions)} fUSDC`,
+    );
+    // Verify oversubscription (total > target)
+    expect(totalContributions).toBeGreaterThan(TARGET_USDC);
+    console.log("   ✅ Presale is oversubscribed!\n");
 
-      // Verify user presale info
-      const userInfo = await aliceSDK.getUserPresaleInfo(presaleId, alice);
-      expect(userInfo.presaleId).toBe(presaleId);
-      expect(userInfo.user).toBe(alice);
-      expect(userInfo.contribution).toBe(aliceContribution - withdrawAmount);
-      expect(userInfo.tokensClaimed).toBe(false);
-      expect(userInfo.refundClaimed).toBe(false);
-      console.log(
-        `   📊 Alice remaining contribution: ${aliceSDK.formatUsdc(aliceRemainingContribution)} USDC`,
-      );
+    // ============ Step 5: Wait for presale to end ============
+    console.log("⏰ Step 5: Waiting for presale to end...");
+    await waitForPresaleEnd(presaleAfterContributions.endTime);
 
-      // ============================================
-      // Step 4: End presale period
-      // ============================================
-      console.log("\n⏰ Step 4: Advancing time to end presale period...");
-      await advanceTime(PRESALE_DURATION + 1n);
-      console.log("   ✅ Presale period ended");
+    // Verify status changed to PendingAllocation
+    const presaleAfterEnd = await sdk.getPresale(presaleId);
+    expect(presaleAfterEnd.status).toBe(PresaleStatus.PendingAllocation);
+    console.log("   ✅ Presale ended, status: PendingAllocation\n");
 
-      // ============================================
-      // Step 5: Admin sets max accepted USDC per user
-      // ============================================
-      console.log("\n📤 Step 5: Admin setting max accepted USDC...");
-      // Total contributions after withdrawal: 4.5k + 3k + 2.5k = 10k USDC
-      // Set max accepted USDC per user:
-      // - Alice: max 4.5k (accepts all her contribution)
-      // - Bob: max 3k (accepts all his contribution)
-      // - Charlie: max 2k (accepts 2k of 2.5k, refund 500 USDC)
-      // Total accepted: 9.5k USDC
-      const allocations = [
-        {
-          user: alice,
-          maxUsdc: parseUnits("4500", USDC_DECIMALS), // Alice's full remaining contribution
-        },
-        {
-          user: bob,
-          maxUsdc: parseUnits("3000", USDC_DECIMALS), // Bob's full contribution
-        },
-        {
-          user: charlie,
-          maxUsdc: parseUnits("2000", USDC_DECIMALS), // Charlie partial: 2k accepted, 500 USDC refund
-        },
-      ];
+    // ============ Step 6: Set allocations ============
+    console.log("📋 Step 6: Setting allocation amounts...");
 
-      await setMaxAcceptedUsdcForUsers(presaleId, allocations);
-      console.log("   ✅ Max accepted USDC set for all users");
+    const users = [deployerAddress, address1, address2, address3, address4];
+    const allocations = [
+      ALLOCATION_AMOUNT_1,
+      ALLOCATION_AMOUNT_2,
+      ALLOCATION_AMOUNT_3,
+      ALLOCATION_AMOUNT_4,
+      ALLOCATION_AMOUNT_5,
+    ];
 
-      // Verify accepted USDC
-      console.log("   - Verifying accepted contributions...");
-      const aliceAccepted = await aliceSDK.getAcceptedContribution(
-        presaleId,
-        alice,
-      );
-      expect(aliceAccepted).toBe(parseUnits("4500", USDC_DECIMALS));
-
-      const bobAccepted = await bobSDK.getAcceptedContribution(presaleId, bob);
-      expect(bobAccepted).toBe(parseUnits("3000", USDC_DECIMALS));
-
-      const charlieAccepted = await charlieSDK.getAcceptedContribution(
-        presaleId,
-        charlie,
-      );
-      expect(charlieAccepted).toBe(parseUnits("2000", USDC_DECIMALS));
-
-      console.log(
-        `   ✅ Alice accepted: ${aliceSDK.formatUsdc(aliceAccepted)} USDC`,
-      );
-      console.log(`   ✅ Bob accepted: ${bobSDK.formatUsdc(bobAccepted)} USDC`);
-      console.log(
-        `   ✅ Charlie accepted: ${charlieSDK.formatUsdc(charlieAccepted)} USDC`,
-      );
-
-      // ============================================
-      // Step 6: Complete deployment (factory simulation)
-      // ============================================
-      console.log("\n🏭 Step 6: Completing deployment (factory simulation)...");
-      await completeDeployment(presaleId);
-      console.log("   ✅ Deployment completed");
-
-      // Verify presale is claimable
-      const presaleAfterDeploy = await aliceSDK.getPresale(presaleId);
-      expect(presaleAfterDeploy.status).toBe(PresaleStatus.Claimable);
-      expect(aliceSDK.isPresaleClaimable(presaleAfterDeploy)).toBe(true);
-      console.log("   ✅ Presale status: Claimable");
-
-      // ============================================
-      // Step 7: Users claim tokens and refunds (single transaction each)
-      // ============================================
-      console.log("\n🎁 Step 7: Users claiming tokens and refunds...");
-
-      // Alice claims (tokens only, no refund)
-      // Token allocations are now calculated as: (acceptedUsdc / totalAcceptedUsdc) * tokenSupply
-      // Total accepted USDC = 4500 + 3000 + 2000 = 9500 USDC
-      // Alice: 4500/9500 * 50B = ~23.68B tokens
-      // Bob: 3000/9500 * 50B = ~15.79B tokens
-      // Charlie: 2000/9500 * 50B = ~10.53B tokens
-
-      // Alice claims tokens
-      console.log("   - Alice claiming...");
-      const aliceTokensBefore = await publicClient.readContract({
-        address: tokenAddress,
-        abi: ERC20Abi,
-        functionName: "balanceOf",
-        args: [alice],
-      });
-      await (await aliceSDK.claim({ presaleId })).wait();
-      const aliceTokensAfter = await publicClient.readContract({
-        address: tokenAddress,
-        abi: ERC20Abi,
-        functionName: "balanceOf",
-        args: [alice],
-      });
-      const aliceTokensClaimed = aliceTokensAfter - aliceTokensBefore;
-      expect(aliceTokensClaimed).toBeGreaterThan(0n);
-      expect(await aliceSDK.hasClaimedTokens(presaleId, alice)).toBe(true);
-      console.log(
-        `   ✅ Alice claimed ${aliceSDK.formatTokens(aliceTokensClaimed)} tokens`,
-      );
-
-      // Bob claims (tokens only, no refund)
-      console.log("   - Bob claiming...");
-      const bobTokensBefore = await publicClient.readContract({
-        address: tokenAddress,
-        abi: ERC20Abi,
-        functionName: "balanceOf",
-        args: [bob],
-      });
-      await (await bobSDK.claim({ presaleId })).wait();
-      const bobTokensAfter = await publicClient.readContract({
-        address: tokenAddress,
-        abi: ERC20Abi,
-        functionName: "balanceOf",
-        args: [bob],
-      });
-      const bobTokensClaimed = bobTokensAfter - bobTokensBefore;
-      expect(bobTokensClaimed).toBeGreaterThan(0n);
-      expect(await bobSDK.hasClaimedTokens(presaleId, bob)).toBe(true);
-      console.log(
-        `   ✅ Bob claimed ${bobSDK.formatTokens(bobTokensClaimed)} tokens`,
-      );
-
-      // Charlie claims tokens AND refund in single transaction
-      // Refund = contribution - min(contribution, maxAcceptedUsdc) = 2500 - 2000 = 500 USDC
-      console.log("   - Charlie claiming (tokens + refund)...");
-      const charlieTokensBefore = await publicClient.readContract({
-        address: tokenAddress,
-        abi: ERC20Abi,
-        functionName: "balanceOf",
-        args: [charlie],
-      });
-      const charlieUsdcBefore = await charlieSDK.getUsdcBalance(charlie);
-      await (await charlieSDK.claim({ presaleId })).wait();
-      const charlieTokensAfter = await publicClient.readContract({
-        address: tokenAddress,
-        abi: ERC20Abi,
-        functionName: "balanceOf",
-        args: [charlie],
-      });
-      const charlieUsdcAfter = await charlieSDK.getUsdcBalance(charlie);
-      const charlieTokensClaimed = charlieTokensAfter - charlieTokensBefore;
-      const refundAmount = charlieUsdcAfter - charlieUsdcBefore;
-      expect(charlieTokensClaimed).toBeGreaterThan(0n);
-      expect(refundAmount).toBe(parseUnits("500", USDC_DECIMALS));
-      expect(await charlieSDK.hasClaimedTokens(presaleId, charlie)).toBe(true);
-      expect(await charlieSDK.hasClaimedRefund(presaleId, charlie)).toBe(true);
-      console.log(
-        `   ✅ Charlie claimed ${charlieSDK.formatTokens(charlieTokensClaimed)} tokens + ${charlieSDK.formatUsdc(refundAmount)} USDC refund`,
-      );
-
-      // ============================================
-      // Step 8: Verify final state
-      // ============================================
-      console.log("\n✨ Step 8: Verifying final state...");
-      const finalAliceInfo = await aliceSDK.getUserPresaleInfo(
-        presaleId,
-        alice,
-      );
-      expect(finalAliceInfo.tokensClaimed).toBe(true);
-
-      const finalCharlieInfo = await charlieSDK.getUserPresaleInfo(
-        presaleId,
-        charlie,
-      );
-      expect(finalCharlieInfo.tokensClaimed).toBe(true);
-      expect(finalCharlieInfo.refundClaimed).toBe(true);
-
-      // Test SDK helper methods
-      const progressPercentage =
-        aliceSDK.getProgressPercentage(presaleAfterDeploy);
-      expect(progressPercentage).toBe(100); // Target was met
-
-      expect(aliceSDK.getPresaleStatusString(PresaleStatus.Claimable)).toBe(
-        "Claimable",
-      );
-      expect(aliceSDK.formatUsdc(parseUnits("1000", USDC_DECIMALS))).toBe(
-        "1000",
-      );
-      expect(aliceSDK.formatTokens(parseUnits("1000000", TOKEN_DECIMALS))).toBe(
-        "1000000",
-      );
-
-      console.log("   ✅ All final state verifications passed");
-      console.log("\n🎉 Full Presale Flow Integration Test COMPLETED!\n");
+    const batchSetHash = await deployerWallet.writeContract({
+      address: BASE_SEPOLIA_CONFIG.presaleAddress,
+      abi: KarmaAllocatedPresaleAbi,
+      functionName: "batchSetMaxAcceptedUsdc",
+      args: [presaleId, users, allocations],
+      chain: BASE_SEPOLIA_CONFIG.chain,
+      account: deployerWallet.account!,
     });
-  },
-);
+    await publicClient.waitForTransactionReceipt({ hash: batchSetHash });
+
+    // Wait for RPC to sync after setting allocations
+    console.log("   ⏳ Waiting for RPC sync...");
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    console.log(
+      `   Deployer allocation: ${formatUsdc(ALLOCATION_AMOUNT_1)} fUSDC`,
+    );
+    console.log(
+      `   Account 1 allocation: ${formatUsdc(ALLOCATION_AMOUNT_2)} fUSDC`,
+    );
+    console.log(
+      `   Account 2 allocation: ${formatUsdc(ALLOCATION_AMOUNT_3)} fUSDC`,
+    );
+    console.log(
+      `   Account 3 allocation: ${formatUsdc(ALLOCATION_AMOUNT_4)} fUSDC`,
+    );
+    console.log(
+      `   Account 4 allocation: ${formatUsdc(ALLOCATION_AMOUNT_5)} fUSDC`,
+    );
+
+    // Verify status changed to AllocationSet
+    const presaleAfterAllocation = await sdk.getPresale(presaleId);
+    expect(presaleAfterAllocation.status).toBe(PresaleStatus.AllocationSet);
+    console.log("   ✅ Allocations set, status: AllocationSet\n");
+
+    // ============ Step 7: Prepare for deployment ============
+    console.log("🔧 Step 7: Preparing for deployment...");
+
+    const salt = ("0x" + Date.now().toString(16).padStart(64, "0")) as Hash;
+
+    const prepareHash = await deployerWallet.writeContract({
+      address: BASE_SEPOLIA_CONFIG.presaleAddress,
+      abi: KarmaAllocatedPresaleAbi,
+      functionName: "prepareForDeployment",
+      args: [presaleId, salt],
+      chain: BASE_SEPOLIA_CONFIG.chain,
+      account: deployerWallet.account!,
+    });
+    await publicClient.waitForTransactionReceipt({ hash: prepareHash });
+
+    // Wait for RPC to sync after preparing for deployment
+    console.log("   ⏳ Waiting for RPC sync...");
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    // Verify status changed to ReadyForDeployment
+    const presaleReady = await sdk.getPresale(presaleId);
+    expect(presaleReady.status).toBe(PresaleStatus.ReadyForDeployment);
+    console.log(
+      "   ✅ Presale ready for deployment, status: ReadyForDeployment\n",
+    );
+
+    // ============ Step 8: Deploy Token ============
+    console.log("🚀 Step 8: Deploying token via Karma factory...");
+
+    // Get the deployment config from the presale for logging
+    const presaleForDeployment = await sdk.getPresale(presaleId);
+    console.log(`   Karma Factory: ${BASE_SEPOLIA_CONFIG.karmaFactory}`);
+    console.log(
+      `   Token Name: ${presaleForDeployment.deploymentConfig.tokenConfig.name}`,
+    );
+    console.log(
+      `   Token Symbol: ${presaleForDeployment.deploymentConfig.tokenConfig.symbol}`,
+    );
+
+    // Deploy token using SDK
+    const deployResult = await sdk.deployToken({ presaleId });
+    const deployedTokenAddress = deployResult.tokenAddress;
+
+    console.log(`   ✅ Token deployed at: ${deployedTokenAddress}`);
+
+    // Wait for RPC to sync after token deployment
+    console.log("   ⏳ Waiting for RPC sync...");
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+
+    // Verify status changed to Claimable
+    const presaleClaimable = await sdk.getPresale(presaleId);
+    expect(presaleClaimable.status).toBe(PresaleStatus.Claimable);
+    expect(presaleClaimable.deployedToken).toBe(deployedTokenAddress);
+    console.log("   ✅ Presale status: Claimable\n");
+
+    // ============ Step 9: Claim Tokens and Refunds ============
+    console.log("💎 Step 9: Claiming tokens and refunds for all users...\n");
+
+    // Track total tokens and refunds claimed
+    let totalTokensClaimed = 0n;
+    let totalRefundsClaimed = 0n;
+
+    // Claim for deployer
+    console.log("   Deployer claiming...");
+    const deployerClaim = await claimFromPresale(deployerWallet, presaleId);
+    console.log(
+      `   ✅ Deployer claimed: ${formatUnits(deployerClaim.tokenAmount, 18)} tokens, ${formatUsdc(deployerClaim.refundAmount)} fUSDC refund`,
+    );
+    totalTokensClaimed += deployerClaim.tokenAmount;
+    totalRefundsClaimed += deployerClaim.refundAmount;
+
+    // Claim for account 1
+    console.log("   Account 1 claiming...");
+    const account1Claim = await claimFromPresale(wallet1, presaleId);
+    console.log(
+      `   ✅ Account 1 claimed: ${formatUnits(account1Claim.tokenAmount, 18)} tokens, ${formatUsdc(account1Claim.refundAmount)} fUSDC refund`,
+    );
+    totalTokensClaimed += account1Claim.tokenAmount;
+    totalRefundsClaimed += account1Claim.refundAmount;
+
+    // Claim for account 2
+    console.log("   Account 2 claiming...");
+    const account2Claim = await claimFromPresale(wallet2, presaleId);
+    console.log(
+      `   ✅ Account 2 claimed: ${formatUnits(account2Claim.tokenAmount, 18)} tokens, ${formatUsdc(account2Claim.refundAmount)} fUSDC refund`,
+    );
+    totalTokensClaimed += account2Claim.tokenAmount;
+    totalRefundsClaimed += account2Claim.refundAmount;
+
+    // Claim for account 3
+    console.log("   Account 3 claiming...");
+    const account3Claim = await claimFromPresale(wallet3, presaleId);
+    console.log(
+      `   ✅ Account 3 claimed: ${formatUnits(account3Claim.tokenAmount, 18)} tokens, ${formatUsdc(account3Claim.refundAmount)} fUSDC refund`,
+    );
+    totalTokensClaimed += account3Claim.tokenAmount;
+    totalRefundsClaimed += account3Claim.refundAmount;
+
+    // Claim for account 4
+    console.log("   Account 4 claiming...");
+    const account4Claim = await claimFromPresale(wallet4, presaleId);
+    console.log(
+      `   ✅ Account 4 claimed: ${formatUnits(account4Claim.tokenAmount, 18)} tokens, ${formatUsdc(account4Claim.refundAmount)} fUSDC refund`,
+    );
+    totalTokensClaimed += account4Claim.tokenAmount;
+    totalRefundsClaimed += account4Claim.refundAmount;
+
+    console.log("\n   📊 Claim Summary:");
+    console.log(
+      `   Total Tokens Claimed: ${formatUnits(totalTokensClaimed, 18)}`,
+    );
+    console.log(
+      `   Total Refunds Claimed: ${formatUsdc(totalRefundsClaimed)} fUSDC`,
+    );
+
+    // Verify that refunds equal the oversubscription amount
+    const expectedRefunds = totalContributions - TARGET_USDC;
+    expect(totalRefundsClaimed).toBe(expectedRefunds);
+    console.log("   ✅ Refunds match oversubscription amount!\n");
+
+    // ============ Step 10: Claim USDC by Presale Owner ============
+    console.log("💰 Step 10: Presale owner claiming USDC proceeds...");
+
+    const claimUsdcHash = await deployerWallet.writeContract({
+      address: BASE_SEPOLIA_CONFIG.presaleAddress,
+      abi: KarmaAllocatedPresaleAbi,
+      functionName: "claimUsdc",
+      args: [presaleId, deployerAddress],
+      chain: BASE_SEPOLIA_CONFIG.chain,
+      account: deployerWallet.account!,
+    });
+    const claimUsdcReceipt = await publicClient.waitForTransactionReceipt({
+      hash: claimUsdcHash,
+    });
+
+    // Parse UsdcClaimed event
+    let usdcClaimedAmount = 0n;
+    let usdcFeeAmount = 0n;
+    for (const log of claimUsdcReceipt.logs) {
+      try {
+        const decoded = decodeEventLog({
+          abi: KarmaAllocatedPresaleAbi,
+          data: log.data,
+          topics: log.topics,
+        });
+        if (decoded.eventName === "UsdcClaimed") {
+          const args = decoded.args as { amount: bigint; fee: bigint };
+          usdcClaimedAmount = args.amount;
+          usdcFeeAmount = args.fee;
+        }
+      } catch {
+        // Not a matching event
+      }
+    }
+
+    console.log(
+      `   ✅ Presale owner claimed: ${formatUsdc(usdcClaimedAmount)} fUSDC`,
+    );
+    console.log(`   📊 Karma fee: ${formatUsdc(usdcFeeAmount)} fUSDC`);
+
+    // ============ Final Summary ============
+    console.log("\n" + "=".repeat(60));
+    console.log("📊 FINAL TEST SUMMARY");
+    console.log("=".repeat(60));
+    console.log(`   Presale ID: ${presaleId}`);
+    console.log(`   Deployed Token: ${deployedTokenAddress}`);
+    console.log(
+      `   Total Contributed: ${formatUsdc(totalContributions)} fUSDC`,
+    );
+    console.log(`   Target: ${formatUsdc(TARGET_USDC)} fUSDC`);
+    console.log(
+      `   Oversubscription: ${formatUsdc(totalContributions - TARGET_USDC)} fUSDC`,
+    );
+    console.log(
+      `   Total Tokens Distributed: ${formatUnits(totalTokensClaimed, 18)}`,
+    );
+    console.log(`   Total Refunds: ${formatUsdc(totalRefundsClaimed)} fUSDC`);
+    console.log(
+      `   USDC to Presale Owner: ${formatUsdc(usdcClaimedAmount)} fUSDC`,
+    );
+    console.log(`   Karma Fee: ${formatUsdc(usdcFeeAmount)} fUSDC`);
+
+    const presaleFinal = await sdk.getPresale(presaleId);
+    console.log(
+      `   Final Status: ${sdk.getPresaleStatusString(presaleFinal.status)}`,
+    );
+    console.log("=".repeat(60));
+
+    console.log("\n🎉 Full Presale Flow Integration Test COMPLETED!\n");
+    console.log("✅ All steps verified:");
+    console.log("   1. Created presale");
+    console.log("   2. Contributions from 5 accounts (oversubscribed)");
+    console.log("   3. Waited for presale end");
+    console.log("   4. Set allocations");
+    console.log("   5. Prepared for deployment");
+    console.log("   6. Deployed token via Karma factory");
+    console.log("   7. All users claimed tokens + refunds");
+    console.log("   8. Presale owner claimed USDC proceeds\n");
+  }, 600000); // 10 minute timeout for the full flow including deployment
+});

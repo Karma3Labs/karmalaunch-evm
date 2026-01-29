@@ -26,6 +26,12 @@ export {
   type TransactionResult,
   type TransactionReceipt,
 
+  // Presale creation & deployment types
+  type CreatePresaleParams,
+  type DeployTokenParams,
+  type CreatePresaleResult,
+  type DeployTokenResult,
+
   // Admin types
   type SetMaxAcceptedUsdcParams,
   type BatchSetMaxAcceptedUsdcParams,
@@ -58,4 +64,5 @@ export {
 
 // ABIs
 export { KarmaAllocatedPresaleAbi } from "./abis/KarmaAllocatedPresale.js";
+export { KarmaAbi } from "./abis/Karma.js";
 export { ERC20Abi } from "./abis/ERC20.js";

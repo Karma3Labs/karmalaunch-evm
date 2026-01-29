@@ -5,9 +5,12 @@ import {
   type WalletClient,
   formatUnits,
   parseUnits,
+  encodeAbiParameters,
+  decodeEventLog,
 } from "viem";
 
 import { KarmaAllocatedPresaleAbi } from "./abis/KarmaAllocatedPresale.js";
+import { KarmaAbi } from "./abis/Karma.js";
 import { ERC20Abi } from "./abis/ERC20.js";
 import {
   type KarmaPresaleSDKConfig,
@@ -18,6 +21,11 @@ import {
   type WithdrawParams,
   type ClaimParams,
   type TransactionResult,
+  type CreatePresaleParams,
+  type DeployTokenParams,
+  type CreatePresaleResult,
+  type DeployTokenResult,
+  type DeploymentConfig,
   PresaleStatus,
   PresaleSDKError,
   InsufficientBalanceError,
@@ -85,6 +93,7 @@ const TOKEN_DECIMALS = 18;
 
 export class KarmaPresaleSDK {
   private readonly presaleAddress: Address;
+  private readonly karmaFactoryAddress: Address;
   private readonly usdcAddress: Address;
   private readonly publicClient: PublicClient;
   private walletClient: WalletClient | null = null;
@@ -95,6 +104,7 @@ export class KarmaPresaleSDK {
     walletClient?: WalletClient,
   ) {
     this.presaleAddress = config.presaleContractAddress;
+    this.karmaFactoryAddress = config.karmaFactoryAddress;
     this.usdcAddress = config.usdcAddress;
     this.publicClient = publicClient;
     this.walletClient = walletClient ?? null;
@@ -116,9 +126,18 @@ export class KarmaPresaleSDK {
     return this.walletClient;
   }
 
-  private async getAccount(): Promise<Address> {
+  private getAccount(): Address {
     const walletClient = this.getWalletClient();
-    const [account] = await walletClient.getAddresses();
+    const account = walletClient.account;
+    if (!account) {
+      throw new PresaleSDKError("No account found in wallet", "NO_ACCOUNT");
+    }
+    return account.address;
+  }
+
+  private getAccountObject() {
+    const walletClient = this.getWalletClient();
+    const account = walletClient.account;
     if (!account) {
       throw new PresaleSDKError("No account found in wallet", "NO_ACCOUNT");
     }
@@ -287,7 +306,7 @@ export class KarmaPresaleSDK {
 
   async approveUsdc(amount: bigint): Promise<TransactionResult> {
     const walletClient = this.getWalletClient();
-    const account = await this.getAccount();
+    const account = this.getAccountObject();
 
     const hash = await walletClient.writeContract({
       address: this.usdcAddress,
@@ -312,7 +331,8 @@ export class KarmaPresaleSDK {
 
   async contribute(params: ContributeParams): Promise<TransactionResult> {
     const walletClient = this.getWalletClient();
-    const account = await this.getAccount();
+    const account = this.getAccountObject();
+    const accountAddress = account.address;
 
     // Validate presale is active
     const presale = await this.getPresale(params.presaleId);
@@ -321,13 +341,13 @@ export class KarmaPresaleSDK {
     }
 
     // Check USDC balance
-    const balance = await this.getUsdcBalance(account);
+    const balance = await this.getUsdcBalance(accountAddress);
     if (balance < params.amount) {
       throw new InsufficientBalanceError(params.amount, balance);
     }
 
     // Check USDC allowance
-    const allowance = await this.getUsdcAllowance(account);
+    const allowance = await this.getUsdcAllowance(accountAddress);
     if (allowance < params.amount) {
       throw new InsufficientAllowanceError(params.amount, allowance);
     }
@@ -347,8 +367,8 @@ export class KarmaPresaleSDK {
   async contributeWithApproval(
     params: ContributeParams,
   ): Promise<TransactionResult> {
-    const account = await this.getAccount();
-    const allowance = await this.getUsdcAllowance(account);
+    const accountAddress = this.getAccount();
+    const allowance = await this.getUsdcAllowance(accountAddress);
 
     if (allowance < params.amount) {
       const approvalResult = await this.approveUsdc(params.amount);
@@ -362,10 +382,14 @@ export class KarmaPresaleSDK {
     params: WithdrawParams,
   ): Promise<TransactionResult> {
     const walletClient = this.getWalletClient();
-    const account = await this.getAccount();
+    const account = this.getAccountObject();
+    const accountAddress = account.address;
 
     // Check user has enough contribution to withdraw
-    const contribution = await this.getContribution(params.presaleId, account);
+    const contribution = await this.getContribution(
+      params.presaleId,
+      accountAddress,
+    );
     if (contribution < params.amount) {
       throw new InsufficientBalanceError(params.amount, contribution);
     }
@@ -389,7 +413,8 @@ export class KarmaPresaleSDK {
    */
   async claim(params: ClaimParams): Promise<TransactionResult> {
     const walletClient = this.getWalletClient();
-    const account = await this.getAccount();
+    const account = this.getAccountObject();
+    const accountAddress = account.address;
 
     // Validate presale is claimable
     const presale = await this.getPresale(params.presaleId);
@@ -398,15 +423,21 @@ export class KarmaPresaleSDK {
     }
 
     // Check user has something to claim
-    const allocation = await this.getTokenAllocation(params.presaleId, account);
-    const refundAmount = await this.getRefundAmount(params.presaleId, account);
+    const allocation = await this.getTokenAllocation(
+      params.presaleId,
+      accountAddress,
+    );
+    const refundAmount = await this.getRefundAmount(
+      params.presaleId,
+      accountAddress,
+    );
     const tokensClaimed = await this.hasClaimedTokens(
       params.presaleId,
-      account,
+      accountAddress,
     );
     const refundClaimed = await this.hasClaimedRefund(
       params.presaleId,
-      account,
+      accountAddress,
     );
 
     const hasUnclaimedTokens = allocation > 0n && !tokensClaimed;
@@ -428,18 +459,165 @@ export class KarmaPresaleSDK {
     return this.createTransactionResult(hash);
   }
 
-  /**
-   * @deprecated Use claim() instead which handles both tokens and refunds
-   */
-  async claimTokens(params: ClaimParams): Promise<TransactionResult> {
-    return this.claim(params);
+  // ============ Presale Creation & Token Deployment ============
+
+  async createPresale(
+    params: CreatePresaleParams,
+  ): Promise<CreatePresaleResult> {
+    const walletClient = this.getWalletClient();
+    const account = this.getAccountObject();
+
+    const hash = await walletClient.writeContract({
+      address: this.presaleAddress,
+      abi: KarmaAllocatedPresaleAbi,
+      functionName: "createPresale",
+      args: [
+        params.presaleOwner,
+        params.targetUsdc,
+        params.minUsdc,
+        params.duration,
+        params.deploymentConfig,
+      ],
+      account,
+      chain: walletClient.chain,
+    });
+
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+
+    // Find PresaleCreated event to get presaleId
+    let presaleId: bigint | undefined;
+    for (const log of receipt.logs) {
+      try {
+        const decoded = decodeEventLog({
+          abi: KarmaAllocatedPresaleAbi,
+          data: log.data,
+          topics: log.topics,
+        });
+        if (decoded.eventName === "PresaleCreated") {
+          presaleId = (decoded.args as { presaleId: bigint }).presaleId;
+          break;
+        }
+      } catch {
+        // Not a matching event
+      }
+    }
+
+    if (!presaleId) {
+      throw new PresaleSDKError(
+        "PresaleCreated event not found in transaction receipt",
+        "EVENT_NOT_FOUND",
+      );
+    }
+
+    return {
+      presaleId,
+      transactionHash: hash,
+      blockNumber: receipt.blockNumber,
+    };
   }
 
-  /**
-   * @deprecated Use claim() instead which handles both tokens and refunds
-   */
-  async claimRefund(params: ClaimParams): Promise<TransactionResult> {
-    return this.claim(params);
+  async deployToken(params: DeployTokenParams): Promise<DeployTokenResult> {
+    const walletClient = this.getWalletClient();
+    const account = this.getAccountObject();
+
+    // Get the presale to retrieve the deployment config
+    const presale = await this.getPresale(params.presaleId);
+
+    // Verify presale is ready for deployment
+    if (presale.status !== PresaleStatus.ReadyForDeployment) {
+      throw new PresaleSDKError(
+        `Presale ${params.presaleId} is not ready for deployment. Current status: ${PresaleStatus[presale.status]}`,
+        "PRESALE_NOT_READY",
+      );
+    }
+
+    // Encode the presaleId as extensionData for the presale extension
+    const encodedPresaleId = encodeAbiParameters(
+      [{ type: "uint256" }],
+      [params.presaleId],
+    );
+
+    // Build the final deployment config with the encoded presaleId
+    const finalDeploymentConfig: DeploymentConfig = {
+      tokenConfig: presale.deploymentConfig.tokenConfig,
+      poolConfig: presale.deploymentConfig.poolConfig,
+      lockerConfig: presale.deploymentConfig.lockerConfig,
+      mevModuleConfig: presale.deploymentConfig.mevModuleConfig,
+      extensionConfigs: presale.deploymentConfig.extensionConfigs.map(
+        (ext) => ({
+          extension: ext.extension,
+          msgValue: ext.msgValue,
+          extensionBps: ext.extensionBps,
+          // Set extensionData for presale extension
+          extensionData:
+            ext.extension.toLowerCase() === this.presaleAddress.toLowerCase()
+              ? encodedPresaleId
+              : ext.extensionData,
+        }),
+      ),
+    };
+
+    const hash = await walletClient.writeContract({
+      address: this.karmaFactoryAddress,
+      abi: KarmaAbi,
+      functionName: "deployToken",
+      args: [finalDeploymentConfig],
+      account,
+      chain: walletClient.chain,
+    });
+
+    const receipt = await this.publicClient.waitForTransactionReceipt({ hash });
+
+    // Find TokenCreated event to get the deployed token address
+    let tokenAddress: Address | undefined;
+    for (const log of receipt.logs) {
+      try {
+        const decoded = decodeEventLog({
+          abi: KarmaAbi,
+          data: log.data,
+          topics: log.topics,
+        });
+        if (decoded.eventName === "TokenCreated") {
+          tokenAddress = (decoded.args as { tokenAddress: Address })
+            .tokenAddress;
+          break;
+        }
+      } catch {
+        // Not a matching event
+      }
+    }
+
+    // Fallback: try to get token address from TokensReceived event on presale
+    if (!tokenAddress) {
+      for (const log of receipt.logs) {
+        try {
+          const decoded = decodeEventLog({
+            abi: KarmaAllocatedPresaleAbi,
+            data: log.data,
+            topics: log.topics,
+          });
+          if (decoded.eventName === "TokensReceived") {
+            tokenAddress = (decoded.args as { token: Address }).token;
+            break;
+          }
+        } catch {
+          // Not a matching event
+        }
+      }
+    }
+
+    if (!tokenAddress) {
+      throw new PresaleSDKError(
+        "TokenCreated event not found in transaction receipt",
+        "EVENT_NOT_FOUND",
+      );
+    }
+
+    return {
+      tokenAddress,
+      transactionHash: hash,
+      blockNumber: receipt.blockNumber,
+    };
   }
 
   // ============ Utility Functions ============

@@ -299,25 +299,6 @@ contract KarmaAllocatedPresale is ReentrancyGuard, IKarmaAllocatedPresale, Owner
 
     // ============ Allocation Setting ============
 
-    function setMaxAcceptedUsdc(uint256 presaleId, address user, uint256 maxUsdc)
-        external
-        presaleExists(presaleId)
-        onlyOwnerOrAdmin
-    {
-        _requireStatusOneOf(presaleId, PresaleStatus.PendingAllocation, PresaleStatus.AllocationSet);
-
-        // Remove previous accepted amount from total
-        uint256 previousAccepted = _getAcceptedUsdc(presaleId, user);
-        totalAcceptedUsdc[presaleId] -= previousAccepted;
-
-        // Set new max and calculate new accepted amount
-        maxAcceptedUsdc[presaleId][user] = maxUsdc;
-        uint256 newAccepted = _getAcceptedUsdc(presaleId, user);
-        totalAcceptedUsdc[presaleId] += newAccepted;
-
-        emit MaxAcceptedUsdcSet(presaleId, user, maxUsdc, newAccepted);
-    }
-
     function batchSetMaxAcceptedUsdc(
         uint256 presaleId,
         address[] calldata users,
