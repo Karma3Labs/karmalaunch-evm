@@ -1,6 +1,14 @@
 {
   "name": "@karma3labs/presale-cli",
   "version": "1.0.0",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
   "description": "CLI for Karma Launcher Presale SDK",
   "type": "module",
   "bin": {
@@ -16,7 +24,7 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@karma3labs/presale-sdk-evm": "file:../sdk",
+    "@karma3labs/presale-sdk-evm": "^1.1.0",
     "chalk": "^5.3.0",
     "commander": "^12.1.0",
     "dotenv": "^16.4.5",
