@@ -1,0 +1,46 @@
+{
+  "name": "@karma3labs/presale-cli",
+  "version": "1.0.0",
+  "description": "CLI for Karma Launcher Presale SDK",
+  "type": "module",
+  "bin": {
+    "karma": "./bin/karma.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node ./bin/karma.js",
+    "lint": "eslint src --ext .ts",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@karma3labs/presale-sdk-evm": "file:../sdk",
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "ora": "^8.1.0",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "karma",
+    "presale",
+    "cli",
+    "blockchain",
+    "evm"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/anthropics/KarmaLauncher.git",
+    "directory": "cli"
+  }
+}

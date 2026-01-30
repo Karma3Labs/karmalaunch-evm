@@ -422,77 +422,55 @@ async function setupTestEnvironment(): Promise<void> {
   console.log(`   Account 4 (TEST_KEY_4): ${address4}`);
 }
 
-async function approveUsdcForPresale(
-  wallet: WalletClient,
-  amount: bigint,
-): Promise<void> {
-  const account = wallet.account!;
-  const hash = await wallet.writeContract({
-    address: BASE_SEPOLIA_CONFIG.usdcAddress,
-    abi: ERC20Abi,
-    functionName: "approve",
-    args: [BASE_SEPOLIA_CONFIG.presaleAddress, amount],
-    chain: BASE_SEPOLIA_CONFIG.chain,
-    account,
-  });
-  await publicClient.waitForTransactionReceipt({ hash });
-}
-
-async function contributeToPresale(
+async function contributeToPresaleWithSdk(
+  sdk: KarmaPresaleSDK,
   wallet: WalletClient,
   presaleId: bigint,
   amount: bigint,
 ): Promise<void> {
-  const account = wallet.account!;
-  const hash = await wallet.writeContract({
-    address: BASE_SEPOLIA_CONFIG.presaleAddress,
-    abi: KarmaAllocatedPresaleAbi,
-    functionName: "contribute",
-    args: [presaleId, amount],
-    chain: BASE_SEPOLIA_CONFIG.chain,
-    account,
+  // Set the wallet client for this user
+  sdk.setWalletClient(wallet);
+
+  const accountAddress = wallet.account!.address;
+
+  // Check if approval is needed and handle it manually to avoid RPC sync issues
+  const allowance = await sdk.getUsdcAllowance(accountAddress);
+  if (allowance < amount) {
+    const approvalResult = await sdk.approveUsdc(amount);
+    await approvalResult.wait();
+    // Wait for RPC to sync after approval
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+
+  // Use SDK's contribute method (approval already handled)
+  const result = await sdk.contribute({
+    presaleId,
+    amount,
   });
-  await publicClient.waitForTransactionReceipt({ hash });
+  await result.wait();
 }
 
-async function claimFromPresale(
+async function claimFromPresaleWithSdk(
+  sdk: KarmaPresaleSDK,
   wallet: WalletClient,
   presaleId: bigint,
 ): Promise<{ tokenAmount: bigint; refundAmount: bigint }> {
-  const account = wallet.account!;
-  const hash = await wallet.writeContract({
-    address: BASE_SEPOLIA_CONFIG.presaleAddress,
-    abi: KarmaAllocatedPresaleAbi,
-    functionName: "claim",
-    args: [presaleId],
-    chain: BASE_SEPOLIA_CONFIG.chain,
-    account,
-  });
-  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  // Set the wallet client for this user
+  sdk.setWalletClient(wallet);
 
-  // Parse events to get amounts
-  let tokenAmount = 0n;
-  let refundAmount = 0n;
+  // Get expected amounts before claiming
+  const accountAddress = wallet.account!.address;
+  const tokenAllocation = await sdk.getTokenAllocation(
+    presaleId,
+    accountAddress,
+  );
+  const refundAmount = await sdk.getRefundAmount(presaleId, accountAddress);
 
-  for (const log of receipt.logs) {
-    try {
-      const decoded = decodeEventLog({
-        abi: KarmaAllocatedPresaleAbi,
-        data: log.data,
-        topics: log.topics,
-      });
-      if (decoded.eventName === "TokensClaimed") {
-        tokenAmount = (decoded.args as { tokenAmount: bigint }).tokenAmount;
-      }
-      if (decoded.eventName === "RefundClaimed") {
-        refundAmount = (decoded.args as { refundAmount: bigint }).refundAmount;
-      }
-    } catch {
-      // Not a matching event
-    }
-  }
+  // Use SDK's claim method
+  const result = await sdk.claim({ presaleId });
+  await result.wait();
 
-  return { tokenAmount, refundAmount };
+  return { tokenAmount: tokenAllocation, refundAmount };
 }
 
 async function waitForPresaleEnd(endTime: bigint): Promise<void> {
@@ -663,49 +641,60 @@ describe("Presale Full Flow Integration Test (Base Sepolia)", () => {
     console.log("   ⏳ Waiting for RPC sync...");
     await new Promise((resolve) => setTimeout(resolve, 5000));
 
-    // ============ Step 3: Approve USDC for all accounts ============
-    console.log("💳 Step 3: Approving fUSDC for presale contributions...");
-
-    await Promise.all([
-      approveUsdcForPresale(deployerWallet, CONTRIBUTION_AMOUNT_1),
-      approveUsdcForPresale(wallet1, CONTRIBUTION_AMOUNT_2),
-      approveUsdcForPresale(wallet2, CONTRIBUTION_AMOUNT_3),
-      approveUsdcForPresale(wallet3, CONTRIBUTION_AMOUNT_4),
-      approveUsdcForPresale(wallet4, CONTRIBUTION_AMOUNT_5),
-    ]);
-
-    console.log("   ✅ All accounts approved fUSDC");
-
-    // Wait for RPC to sync after approvals
-    console.log("   ⏳ Waiting for RPC sync...");
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-
-    // ============ Step 4: Contribute from all accounts ============
-    console.log("💰 Step 4: Contributing fUSDC from all accounts...");
-
-    await contributeToPresale(deployerWallet, presaleId, CONTRIBUTION_AMOUNT_1);
+    // ============ Step 3 & 4: Contribute from all accounts using SDK ============
+    // SDK's contributeWithApproval handles approval automatically
     console.log(
-      `   Deployer contributed ${formatUsdc(CONTRIBUTION_AMOUNT_1)} fUSDC`,
+      "💰 Step 3 & 4: Contributing fUSDC from all accounts using SDK...",
     );
 
-    await contributeToPresale(wallet1, presaleId, CONTRIBUTION_AMOUNT_2);
+    await contributeToPresaleWithSdk(
+      sdk,
+      deployerWallet,
+      presaleId,
+      CONTRIBUTION_AMOUNT_1,
+    );
     console.log(
-      `   Account 1 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_2)} fUSDC`,
+      `   Deployer contributed ${formatUsdc(CONTRIBUTION_AMOUNT_1)} fUSDC (approved & contributed via SDK)`,
     );
 
-    await contributeToPresale(wallet2, presaleId, CONTRIBUTION_AMOUNT_3);
+    await contributeToPresaleWithSdk(
+      sdk,
+      wallet1,
+      presaleId,
+      CONTRIBUTION_AMOUNT_2,
+    );
     console.log(
-      `   Account 2 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_3)} fUSDC`,
+      `   Account 1 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_2)} fUSDC (approved & contributed via SDK)`,
     );
 
-    await contributeToPresale(wallet3, presaleId, CONTRIBUTION_AMOUNT_4);
+    await contributeToPresaleWithSdk(
+      sdk,
+      wallet2,
+      presaleId,
+      CONTRIBUTION_AMOUNT_3,
+    );
     console.log(
-      `   Account 3 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_4)} fUSDC`,
+      `   Account 2 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_3)} fUSDC (approved & contributed via SDK)`,
     );
 
-    await contributeToPresale(wallet4, presaleId, CONTRIBUTION_AMOUNT_5);
+    await contributeToPresaleWithSdk(
+      sdk,
+      wallet3,
+      presaleId,
+      CONTRIBUTION_AMOUNT_4,
+    );
     console.log(
-      `   Account 4 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_5)} fUSDC`,
+      `   Account 3 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_4)} fUSDC (approved & contributed via SDK)`,
+    );
+
+    await contributeToPresaleWithSdk(
+      sdk,
+      wallet4,
+      presaleId,
+      CONTRIBUTION_AMOUNT_5,
+    );
+    console.log(
+      `   Account 4 contributed ${formatUsdc(CONTRIBUTION_AMOUNT_5)} fUSDC (approved & contributed via SDK)`,
     );
 
     // Wait for RPC to sync before reading total
@@ -840,45 +829,65 @@ describe("Presale Full Flow Integration Test (Base Sepolia)", () => {
     let totalTokensClaimed = 0n;
     let totalRefundsClaimed = 0n;
 
-    // Claim for deployer
-    console.log("   Deployer claiming...");
-    const deployerClaim = await claimFromPresale(deployerWallet, presaleId);
+    // Claim for deployer using SDK
+    console.log("   Deployer claiming via SDK...");
+    const deployerClaim = await claimFromPresaleWithSdk(
+      sdk,
+      deployerWallet,
+      presaleId,
+    );
     console.log(
       `   ✅ Deployer claimed: ${formatUnits(deployerClaim.tokenAmount, 18)} tokens, ${formatUsdc(deployerClaim.refundAmount)} fUSDC refund`,
     );
     totalTokensClaimed += deployerClaim.tokenAmount;
     totalRefundsClaimed += deployerClaim.refundAmount;
 
-    // Claim for account 1
-    console.log("   Account 1 claiming...");
-    const account1Claim = await claimFromPresale(wallet1, presaleId);
+    // Claim for account 1 using SDK
+    console.log("   Account 1 claiming via SDK...");
+    const account1Claim = await claimFromPresaleWithSdk(
+      sdk,
+      wallet1,
+      presaleId,
+    );
     console.log(
       `   ✅ Account 1 claimed: ${formatUnits(account1Claim.tokenAmount, 18)} tokens, ${formatUsdc(account1Claim.refundAmount)} fUSDC refund`,
     );
     totalTokensClaimed += account1Claim.tokenAmount;
     totalRefundsClaimed += account1Claim.refundAmount;
 
-    // Claim for account 2
-    console.log("   Account 2 claiming...");
-    const account2Claim = await claimFromPresale(wallet2, presaleId);
+    // Claim for account 2 using SDK
+    console.log("   Account 2 claiming via SDK...");
+    const account2Claim = await claimFromPresaleWithSdk(
+      sdk,
+      wallet2,
+      presaleId,
+    );
     console.log(
       `   ✅ Account 2 claimed: ${formatUnits(account2Claim.tokenAmount, 18)} tokens, ${formatUsdc(account2Claim.refundAmount)} fUSDC refund`,
     );
     totalTokensClaimed += account2Claim.tokenAmount;
     totalRefundsClaimed += account2Claim.refundAmount;
 
-    // Claim for account 3
-    console.log("   Account 3 claiming...");
-    const account3Claim = await claimFromPresale(wallet3, presaleId);
+    // Claim for account 3 using SDK
+    console.log("   Account 3 claiming via SDK...");
+    const account3Claim = await claimFromPresaleWithSdk(
+      sdk,
+      wallet3,
+      presaleId,
+    );
     console.log(
       `   ✅ Account 3 claimed: ${formatUnits(account3Claim.tokenAmount, 18)} tokens, ${formatUsdc(account3Claim.refundAmount)} fUSDC refund`,
     );
     totalTokensClaimed += account3Claim.tokenAmount;
     totalRefundsClaimed += account3Claim.refundAmount;
 
-    // Claim for account 4
-    console.log("   Account 4 claiming...");
-    const account4Claim = await claimFromPresale(wallet4, presaleId);
+    // Claim for account 4 using SDK
+    console.log("   Account 4 claiming via SDK...");
+    const account4Claim = await claimFromPresaleWithSdk(
+      sdk,
+      wallet4,
+      presaleId,
+    );
     console.log(
       `   ✅ Account 4 claimed: ${formatUnits(account4Claim.tokenAmount, 18)} tokens, ${formatUsdc(account4Claim.refundAmount)} fUSDC refund`,
     );

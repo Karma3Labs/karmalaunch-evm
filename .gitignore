@@ -3,6 +3,8 @@ cache/
 out/
 sdk/node_modules
 sdk/dist
+cli/node_modules
+cli/dist
 
 # Ignores development broadcast logs
 !/broadcast
